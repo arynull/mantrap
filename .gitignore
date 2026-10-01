@@ -1,6 +1,6 @@
-# .gitignore — mantrap (local-only files are NEVER pushed)
+# mantrap — files not part of the distribution
 
-# --- internal ops files (standing user rule) ---
+# project docs (kept alongside the repo, not published)
 MISSION.md
 RUNBOOK.md
 SPEC.md
@@ -8,13 +8,13 @@ PROGRESS.md
 ERROR_LOG.md
 prompts/
 
-# --- tests are local-only (standing user rule) ---
+# local test suite (not published)
 tests/
 
-# --- secrets ---
+# local secrets
 .telegram.env
 
-# --- python ---
+# python
 __pycache__/
 *.py[cod]
 *.egg-info/
