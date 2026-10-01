@@ -114,6 +114,60 @@ PASS  audit dir writable — /home/user/.mantrap
 
 Exit 0 unless a check FAILs.
 
+### `mantrap keygen [--rotate]`
+
+Creates the Ed25519 signing key for the tamper-evident audit log
+(see below): `~/.mantrap/signing.key`, mode 0600, generated from
+the OS CSPRNG. The implementation is vendored pure Python — no new
+runtime dependency. Refuses to overwrite an existing key; use
+`--rotate` to replace it. Rotation appends a `key.rotate` audit
+record chaining the old key id to the new one, so signatures made
+with the old key stay verifiable forever. The old key file is kept
+as `signing.key.prev` (0600).
+
+Loading the key is fail-closed on permissions: a key file
+readable by group or other is treated as compromised and refused.
+
+### `mantrap audit [--verify] [--since TS] [--json]`
+
+Shows the audit log (pretty-printed by default, one line per
+record; `--json` prints one JSON object per line; `--since`
+filters to records at or after an ISO-8601 timestamp).
+`--verify` re-checks the hash chain and every signature and exits
+1 naming the first broken record:
+
+```
+$ mantrap audit --verify
+audit log verified: 57 records, 1 signatures, chain intact
+```
+
+### `mantrap snapshot [--policy FILE] [--message MSG]`
+
+Snapshots the policy's first writable mount (host-side, via
+`rsync -a --delete`) into
+`~/.mantrap/snapshots/<policy-sha8>/<timestamp>/`, with a manifest
+of every file's size and SHA-256. Needs `rsync` on `PATH` and at
+least one `fs.write` mount (or `exec --add-write`). Prints the
+snapshot id, e.g. `efbf990c/20261001-133235-393685`, and writes a
+`snapshot.create` audit record.
+
+### `mantrap snapshots [--json]` / `mantrap rollback <snap-id> [--dry-run]`
+
+`snapshots` lists snapshots newest-first. `rollback` restores the
+workspace from a snapshot (`--dry-run` shows the file-level diff —
+`added`/`modified`/`deleted` — without changing anything). The
+restore is verified against the manifest afterwards, and a
+`snapshot.rollback` audit record is written.
+
+### `mantrap run --snapshot [--auto-rollback] ...`
+
+`--snapshot` takes a pre-run snapshot of the first `fs.write`
+workspace (ignored with `--dry-run`). If the workload then exits
+non-zero, mantrap prints a rollback hint with the snapshot id;
+`--auto-rollback` (implies `--snapshot`) restores the snapshot
+automatically instead, and the restore is audit-logged. The
+workload's exit code still propagates.
+
 ## Policy reference (`mantrap.yaml`)
 
 ```yaml
@@ -344,6 +398,43 @@ The broker's guarantees:
 
 File sources must be mode 0600 or 0400; anything group- or
 world-readable is refused outright.
+
+## Tamper-evident audit log
+
+Every record in `audit.log` carries `prev_hash` — the SHA-256 of
+the previous record's canonical bytes — forming a hash chain back
+to a genesis hash. Flip one byte in any record and the next
+record's link breaks; `mantrap audit --verify` names the broken
+record and exits 1. Records written before chaining existed
+verify fine and are anchored by newer records chaining onto them.
+
+Every 50 records, when a signing key exists (`mantrap keygen`),
+mantrap appends a `sig` record: an Ed25519 signature over the
+chain tip. The public keys live in the log itself (`key.gen` /
+`key.rotate` records), so verification needs no private key and
+survives key rotation. Verification re-checks every link and
+every signature from the log alone.
+
+One honest limitation: the chain anchors every record that has a
+successor. The very last record is only anchored once the next
+record — or the next periodic signature — commits to it. In other
+words, tampering with the tip is detectable as soon as anything
+else is appended.
+
+## Snapshots and rollback
+
+`mantrap snapshot` copies the policy's first writable mount with
+`rsync -a --delete` into a timestamped directory plus a manifest
+(path, size, SHA-256 per file; symlinks recorded by target).
+`mantrap rollback <snap-id>` restores it — `--dry-run` first
+shows exactly what would change — and then re-verifies the
+restored tree against the manifest, so a corrupted snapshot fails
+loudly instead of silently restoring the wrong files.
+
+`run --snapshot` automates the safety net: a pre-run snapshot is
+taken, and on a non-zero exit you get a rollback hint (or an
+automatic, audit-logged restore with `--auto-rollback`). The
+workload's exit code always propagates.
 
 ## Limitations
 

@@ -1,14 +1,23 @@
-"""Command-line interface: `init`, `run`, `exec`, `doctor`."""
+"""Command-line interface: init/run/exec/doctor/keygen/audit/snapshot."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__
-from .audit import append_record, append_run_record
+from . import __version__, keys, snapshots
+from .audit import (
+    AuditError,
+    append_record,
+    append_run_record,
+    iter_records,
+    utc_now_iso,
+    verify_log,
+)
 from .gates import GateDenied, GateError, GateSession
 from .policy import (
     PolicyError,
@@ -33,6 +42,7 @@ from .secrets import (
     resolve_secrets,
     scrub_argv,
 )
+from .snapshots import SnapshotError
 
 INIT_TEMPLATE = """\
 # mantrap.yaml — deny-by-default sandbox policy.
@@ -135,6 +145,8 @@ def cmd_run(
     approve_all: bool = False,
     add_writes: list[str] | None = None,
     command_name: str = "run",
+    snapshot: bool = False,
+    auto_rollback: bool = False,
 ) -> int:
     """Run a workload in the sandbox. Returns the exit code."""
     if not workload:
@@ -167,6 +179,35 @@ def cmd_run(
         return 2
     if dry_run:
         return _cmd_dry_run(policy_path, policy, workload, secrets)
+    if auto_rollback:
+        snapshot = True  # rolling back needs a pre-run snapshot
+    snap_meta = None
+    if snapshot:
+        try:
+            workspace = _run_workspace(policy, digest)
+            snap_meta = snapshots.create_snapshot(
+                workspace,
+                data_dir=data_dir(),
+                policy_sha256=digest,
+                message="pre-run auto-snapshot",
+            )
+            append_record(
+                {
+                    "ts": utc_now_iso(),
+                    "type": "snapshot.create",
+                    "snap_id": snap_meta.snap_id,
+                    "workspace": str(workspace),
+                    "message": "pre-run auto-snapshot",
+                    "files": snap_meta.files,
+                }
+            )
+            print(
+                f"mantrap: snapshotted workspace -> {snap_meta.snap_id}",
+                file=sys.stderr,
+            )
+        except (PolicyError, SnapshotError, AuditError, OSError) as exc:
+            print(f"error: cannot snapshot workspace: {exc}", file=sys.stderr)
+            return 2
     if approve_all:
         print(
             "mantrap: --approve-all allows every approval gate "
@@ -219,6 +260,39 @@ def cmd_run(
             "(exit 124)",
             file=sys.stderr,
         )
+    if snap_meta is not None and (killed or code != 0):
+        if auto_rollback:
+            try:
+                restored = snapshots.rollback(snap_meta)
+                append_record(
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "snapshot.rollback",
+                        "snap_id": snap_meta.snap_id,
+                        "workspace": snap_meta.workspace,
+                        "restored_files": len(restored),
+                        "auto": True,
+                    }
+                )
+                print(
+                    f"mantrap: run failed; workspace rolled back to "
+                    f"{snap_meta.snap_id} ({len(restored)} files)",
+                    file=sys.stderr,
+                )
+            except (SnapshotError, AuditError, OSError) as exc:
+                print(
+                    f"mantrap: run failed AND auto-rollback failed ({exc}); "
+                    f"snapshot {snap_meta.snap_id} retained for a manual "
+                    "rollback",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"mantrap: run failed; workspace snapshot retained as "
+                f"{snap_meta.snap_id} — restore with "
+                f"`mantrap rollback {snap_meta.snap_id}`",
+                file=sys.stderr,
+            )
     return code
 
 
@@ -250,6 +324,215 @@ def _cmd_dry_run(policy_path, policy, workload, secrets) -> int:
             )
     else:
         print("  {}")
+    return 0
+
+
+def cmd_keygen(*, rotate: bool = False) -> int:
+    """Create (or rotate) the Ed25519 audit-log signing key."""
+    directory = data_dir()
+
+    def _audit(record: dict) -> dict:
+        return append_record(record, directory=directory)
+
+    try:
+        if rotate:
+            new_key_id, _new_pub, old_key_id = keys.rotate(
+                directory, audit_append=_audit
+            )
+            print(f"rotated signing key: {old_key_id} -> {new_key_id}")
+        else:
+            key_id, _pub = keys.generate(directory, audit_append=_audit)
+            print(f"signing key created: {key_id}")
+            print("every 50 audit records are now signed with this key;")
+            print("verify any time with: mantrap audit --verify")
+    except (keys.KeyError, AuditError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _format_record(record: dict) -> str:
+    ts = record.get("ts", "?")
+    rtype = record.get("type", "?")
+    detail = ""
+    if rtype == "run":
+        detail = (
+            f"exit={record.get('exit_code')} "
+            f"dur={record.get('duration_s', 0):.1f}s "
+            f"policy={str(record.get('policy_sha256', ''))[:12]}"
+        )
+    elif rtype in ("net.allow", "net.deny"):
+        detail = (
+            f"{record.get('scheme', '')}://{record.get('domain', '')}"
+            f":{record.get('port', '')} {record.get('reason', '')}"
+        )
+    elif rtype in ("gate.allow", "gate.deny"):
+        detail = (
+            f"{record.get('rule', '')} {record.get('detail', '')} "
+            f"({record.get('decider', '')})"
+        )
+    elif rtype == "sig":
+        detail = (
+            f"key={record.get('key_id', '')} "
+            f"tip={str(record.get('tip_hash', ''))[:12]}…"
+        )
+    elif rtype in ("key.gen", "key.rotate"):
+        detail = f"key_id={record.get('key_id', '')}"
+        if rtype == "key.rotate":
+            detail += f" prev={record.get('prev_key_id', '')}"
+    elif rtype == "snapshot.create":
+        detail = f"{record.get('snap_id', '')} {record.get('message', '')}".strip()
+    elif rtype == "snapshot.rollback":
+        detail = (
+            f"{record.get('snap_id', '')} "
+            f"restored={record.get('restored_files', '?')}"
+        )
+    else:
+        rest = {k: v for k, v in record.items()
+                if k not in ("v", "ts", "type", "prev_hash")}
+        detail = " ".join(f"{k}={v}" for k, v in list(rest.items())[:4])
+    return f"{ts}  {rtype:16} {detail}".rstrip()
+
+
+def _parse_since(raw: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PolicyError(
+            f"--since must be an ISO-8601 timestamp, got {raw!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def cmd_audit(
+    *, verify: bool = False, since: str | None = None,
+    as_json: bool = False,
+) -> int:
+    """Show the audit log; --verify re-checks chain + signatures."""
+    if verify:
+        result = verify_log()
+        if result.ok:
+            print(
+                f"audit log verified: {result.records} records, "
+                f"{result.signatures} signatures, chain intact"
+            )
+            return 0
+        print(f"audit verification FAILED: {result.error}", file=sys.stderr)
+        return 1
+    try:
+        records = list(iter_records())
+    except AuditError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if since is not None:
+        try:
+            cutoff = _parse_since(since)
+        except PolicyError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        records = [
+            (n, r) for n, r in records
+            if datetime.fromisoformat(r["ts"]) >= cutoff
+        ]
+    if as_json:
+        for _n, record in records:
+            print(json.dumps(record, sort_keys=True))
+    else:
+        for _n, record in records:
+            print(_format_record(record))
+    return 0
+
+
+def _run_workspace(policy, digest: str) -> Path:
+    if not policy.fs_write:
+        raise PolicyError(
+            "snapshots need a writable workspace: add an fs.write "
+            "mount (or use `exec --add-write PATH`)"
+        )
+    return Path(policy.fs_write[0])
+
+
+def cmd_snapshot(
+    policy_file: str | None, message: str | None = None
+) -> int:
+    """Snapshot the policy's first writable mount (host-side)."""
+    try:
+        policy_path = resolve_policy_path(policy_file)
+        policy, digest = load_policy(policy_path)
+        workspace = _run_workspace(policy, digest)
+        meta = snapshots.create_snapshot(
+            workspace,
+            data_dir=data_dir(),
+            policy_sha256=digest,
+            message=message,
+        )
+        append_record(
+            {
+                "ts": utc_now_iso(),
+                "type": "snapshot.create",
+                "snap_id": meta.snap_id,
+                "workspace": str(workspace),
+                "message": message or "",
+                "files": meta.files,
+            }
+        )
+    except (PolicyError, SnapshotError, AuditError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"snapshot {meta.snap_id} ({meta.files} files)")
+    return 0
+
+
+def cmd_snapshots(*, as_json: bool = False) -> int:
+    """List snapshots, newest first."""
+    metas = snapshots.list_snapshots(data_dir())
+    if as_json:
+        for meta in metas:
+            print(json.dumps({
+                "snap_id": meta.snap_id,
+                "ts": meta.ts_iso,
+                "message": meta.message,
+                "workspace": meta.workspace,
+                "files": meta.files,
+            }, sort_keys=True))
+    else:
+        for meta in metas:
+            msg = f" — {meta.message}" if meta.message else ""
+            print(f"{meta.snap_id}  {meta.ts_iso}  {meta.files} files{msg}")
+    return 0
+
+
+def cmd_rollback(snap_id: str, *, dry_run: bool = False) -> int:
+    """Restore a snapshot (--dry-run shows the diff first)."""
+    try:
+        meta = snapshots.find_snapshot(data_dir(), snap_id)
+        diffs = snapshots.rollback(meta, dry_run=dry_run)
+    except (SnapshotError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if dry_run:
+        if not diffs:
+            print(f"{meta.snap_id}: workspace already matches the snapshot")
+        for diff in diffs:
+            print(f"{diff.change:8} {diff.path}")
+        return 0
+    try:
+        append_record(
+            {
+                "ts": utc_now_iso(),
+                "type": "snapshot.rollback",
+                "snap_id": meta.snap_id,
+                "workspace": meta.workspace,
+                "restored_files": len(diffs),
+                "auto": False,
+            }
+        )
+    except (AuditError, OSError) as exc:
+        print(f"error: cannot write audit log ({exc})", file=sys.stderr)
+        return 2
+    print(f"rolled back {meta.snap_id} ({len(diffs)} files restored)")
     return 0
 
 
@@ -329,6 +612,16 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
         help="allow every approval-gate ask without prompting "
              "(logged; discouraged)",
     )
+    parser.add_argument(
+        "--snapshot", action="store_true",
+        help="snapshot the first fs.write workspace before the run "
+             "(ignored with --dry-run)",
+    )
+    parser.add_argument(
+        "--auto-rollback", action="store_true",
+        help="restore the pre-run snapshot when the workload exits "
+             "non-zero (implies --snapshot; the restore is audited)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -371,6 +664,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("doctor", help="check the sandbox environment")
+
+    p_keygen = sub.add_parser(
+        "keygen", help="create the audit-log signing key")
+    p_keygen.add_argument(
+        "--rotate", action="store_true",
+        help="replace the existing key (old signatures stay verifiable)",
+    )
+
+    p_audit = sub.add_parser("audit", help="show the audit log")
+    p_audit.add_argument(
+        "--verify", action="store_true",
+        help="re-check the hash chain and every signature; "
+             "exit 1 naming the first broken record",
+    )
+    p_audit.add_argument(
+        "--since", default=None, metavar="TS",
+        help="only show records at or after this ISO-8601 timestamp",
+    )
+    p_audit.add_argument(
+        "--json", action="store_true",
+        help="print records as JSON (one per line)",
+    )
+
+    p_snapshot = sub.add_parser(
+        "snapshot", help="snapshot the policy's writable workspace")
+    p_snapshot.add_argument("--policy", default=None,
+                            help="policy file (default: resolution order)")
+    p_snapshot.add_argument(
+        "--message", default=None,
+        help="label stored with the snapshot",
+    )
+
+    p_snapshots = sub.add_parser("snapshots", help="list snapshots")
+    p_snapshots.add_argument(
+        "--json", action="store_true",
+        help="print snapshots as JSON (one per line)",
+    )
+
+    p_rollback = sub.add_parser(
+        "rollback", help="restore the workspace from a snapshot")
+    p_rollback.add_argument("snap_id", help="snapshot id from `snapshots`")
+    p_rollback.add_argument(
+        "--dry-run", action="store_true",
+        help="show what would change without restoring anything",
+    )
     return parser
 
 
@@ -401,9 +739,23 @@ def main(argv: list[str] | None = None) -> int:
             add_writes=args.add_write
             if args.command == "exec" else None,
             command_name=args.command,
+            snapshot=args.snapshot,
+            auto_rollback=args.auto_rollback,
         )
     if args.command == "doctor":
         return cmd_doctor()
+    if args.command == "keygen":
+        return cmd_keygen(rotate=args.rotate)
+    if args.command == "audit":
+        return cmd_audit(
+            verify=args.verify, since=args.since, as_json=args.json
+        )
+    if args.command == "snapshot":
+        return cmd_snapshot(args.policy, message=args.message)
+    if args.command == "snapshots":
+        return cmd_snapshots(as_json=args.json)
+    if args.command == "rollback":
+        return cmd_rollback(args.snap_id, dry_run=args.dry_run)
     parser.print_help()
     return 2
 
