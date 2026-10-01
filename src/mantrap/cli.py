@@ -1,4 +1,4 @@
-"""Command-line interface: `init`, `run`, `doctor`."""
+"""Command-line interface: `init`, `run`, `exec`, `doctor`."""
 
 from __future__ import annotations
 
@@ -8,12 +8,14 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .audit import append_run_record
+from .audit import append_record, append_run_record
+from .gates import GateDenied, GateError, GateSession
 from .policy import (
     PolicyError,
     data_dir,
     load_policy,
     resolve_policy_path,
+    validate_write_path,
 )
 from .sandbox import (
     SandboxError,
@@ -92,6 +94,20 @@ limits:
   # allow_ports: [443]
   # dns: host
   # allow_private_ips: false
+
+#gates:
+  # Approval gates: the mantrap interlock. Rules evaluate in order;
+  # the first match wins (firewall order — put specific allows before
+  # broad asks). Every decision is written to the audit log.
+  #   - match: {exec.path: /usr/bin/curl}   # glob on the binary
+  #     action: ask                         # allow | deny | ask
+  #   - match: {net.domain: "*.internal"}   # case-insensitive glob
+  #     action: deny
+  #   - match: {fs.write: /data}            # absolute path prefix
+  #     action: ask
+  # ask pauses the workload and prompts on the controlling terminal;
+  # --yes denies every ask (CI), --approve-all allows every ask
+  # (logged; discouraged — prints a warning on every run).
 """
 
 
@@ -110,12 +126,27 @@ def cmd_init(force: bool) -> int:
     return 0
 
 
-def cmd_run(policy_file: str | None, workload: list[str],
-            dry_run: bool = False) -> int:
+def cmd_run(
+    policy_file: str | None,
+    workload: list[str],
+    dry_run: bool = False,
+    *,
+    yes: bool = False,
+    approve_all: bool = False,
+    add_writes: list[str] | None = None,
+    command_name: str = "run",
+) -> int:
     """Run a workload in the sandbox. Returns the exit code."""
     if not workload:
         print(
-            "error: no command given; usage: mantrap run -- <cmd> [args...]",
+            "error: no command given; "
+            f"usage: mantrap {command_name} -- <cmd> [args...]",
+            file=sys.stderr,
+        )
+        return 2
+    if yes and approve_all:
+        print(
+            "error: --yes and --approve-all are mutually exclusive",
             file=sys.stderr,
         )
         return 2
@@ -125,16 +156,41 @@ def cmd_run(policy_file: str | None, workload: list[str],
         # Fail-closed: resolve before preflight/bwrap so nothing
         # starts with a partially-resolved secret set.
         secrets = resolve_secrets(policy.secrets)
-    except (PolicyError, SandboxError, SecretsError) as exc:
+        for raw in add_writes or []:
+            # Same validation as fs.write; appended for this run
+            # only, never written back to the policy file.
+            policy.fs_write.append(
+                validate_write_path(raw, "fs.write (--add-write)")
+            )
+    except (PolicyError, SandboxError, SecretsError, GateError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if dry_run:
         return _cmd_dry_run(policy_path, policy, workload, secrets)
+    if approve_all:
+        print(
+            "mantrap: --approve-all allows every approval gate "
+            "without prompting; every decision is still audited",
+            file=sys.stderr,
+        )
+    gate_session = GateSession(
+        policy.gates,
+        auto_yes=yes,
+        approve_all=approve_all,
+        audit_append=append_record,
+    )
     try:
         bwrap = preflight()
         code, killed, duration, fallback = run_workload(
-            bwrap, policy, workload, secrets=secrets
+            bwrap, policy, workload, secrets=secrets,
+            gate_session=gate_session,
         )
+    except GateDenied as exc:
+        print(
+            f"error: denied by {exc.rule_id}: {exc.detail}",
+            file=sys.stderr,
+        )
+        return 2
     except (PolicyError, SandboxError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -185,6 +241,15 @@ def _cmd_dry_run(policy_path, policy, workload, secrets) -> int:
     )
     print("# bwrap command (secret values masked):")
     print(shlex.join(mask_argv(preview, set(secrets))))
+    print("gates:")
+    if policy.gates:
+        for rule in policy.gates:
+            print(
+                f"  {rule.id}: {rule.match_kind} {rule.pattern}"
+                f" -> {rule.action}"
+            )
+    else:
+        print("  {}")
     return 0
 
 
@@ -248,6 +313,24 @@ def cmd_doctor() -> int:
     return 0 if ok else 1
 
 
+def _add_run_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--policy", default=None,
+                        help="policy file (default: resolution order)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the resolved policy (secrets masked) "
+                             "and the bwrap command without running anything")
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="deny every approval-gate ask without prompting "
+             "(for CI; fail-closed)",
+    )
+    parser.add_argument(
+        "--approve-all", action="store_true",
+        help="allow every approval-gate ask without prompting "
+             "(logged; discouraged)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mantrap",
@@ -265,14 +348,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p_run = sub.add_parser("run", help="run a command in the sandbox")
-    p_run.add_argument("--policy", default=None,
-                       help="policy file (default: resolution order)")
-    p_run.add_argument("--dry-run", action="store_true",
-                       help="print the resolved policy (secrets masked) "
-                            "and the bwrap command without running anything")
+    _add_run_flags(p_run)
     p_run.add_argument(
         "workload", nargs=argparse.REMAINDER,
         help="command after --, e.g. mantrap run -- id -u",
+    )
+
+    p_exec = sub.add_parser(
+        "exec",
+        help="run a command in the sandbox with extra write mounts",
+    )
+    _add_run_flags(p_exec)
+    p_exec.add_argument(
+        "--add-write", action="append", default=None, metavar="PATH",
+        help="grant the workload a writable mount for this run only "
+             "(repeatable; validated like fs.write)",
+    )
+    p_exec.add_argument(
+        "workload", nargs=argparse.REMAINDER,
+        help="command after --, e.g. mantrap exec "
+             "--add-write /home/user/out -- make build",
     )
 
     sub.add_parser("doctor", help="check the sandbox environment")
@@ -284,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "init":
         return cmd_init(args.force)
-    if args.command == "run":
+    if args.command in ("run", "exec"):
         workload = list(args.workload or [])
         # argparse REMAINDER keeps the leading "--" when present;
         # drop exactly one so `run -- id` works and `run id` does too.
@@ -293,11 +388,20 @@ def main(argv: list[str] | None = None) -> int:
         if not workload and "--" not in (argv or sys.argv[1:]):
             print(
                 "error: no command given; "
-                "usage: mantrap run -- <cmd> [args...]",
+                f"usage: mantrap {args.command} -- <cmd> [args...]",
                 file=sys.stderr,
             )
             return 2
-        return cmd_run(args.policy, workload, dry_run=args.dry_run)
+        return cmd_run(
+            args.policy,
+            workload,
+            dry_run=args.dry_run,
+            yes=args.yes,
+            approve_all=args.approve_all,
+            add_writes=args.add_write
+            if args.command == "exec" else None,
+            command_name=args.command,
+        )
     if args.command == "doctor":
         return cmd_doctor()
     parser.print_help()

@@ -78,10 +78,28 @@ grace, then SIGKILL). A limit kill exits with code **124**, which
 is distinct from workload failures.
 
 `--dry-run` loads the policy and resolves secrets, then prints the
-resolved policy with secret values masked (`*** (N chars)`) and the
-full bwrap command with secret values masked — without executing
-anything, starting the proxy, or writing an audit record. A missing
-secret still fails closed (exit 2).
+resolved policy with secret values masked (`*** (N chars)`), the
+parsed `gates:` rules, and the full bwrap command with secret
+values masked — without executing anything, starting the proxy, or
+writing an audit record. A missing secret still fails closed
+(exit 2).
+
+### `mantrap run [--yes] [--approve-all] ...`
+
+`run` also takes the approval-gate flags (see Approval gates
+below): `--yes` denies every `ask` gate without prompting
+(for CI; fail-closed), `--approve-all` allows every `ask` gate
+without prompting (logged; discouraged — prints a stderr warning
+on every run). The two flags together are a usage error (exit 2).
+
+### `mantrap exec [--add-write PATH] ... -- <cmd> [args...]`
+
+`exec` is `run` plus per-run writable mounts: `--add-write PATH`
+(repeatable) grants the workload a writable mount for that run
+only. Each path is validated exactly like `fs.write` (absolute,
+no `..`, must exist) and is never written back to the policy
+file. Approval gates evaluate the final mount list, so a gate can
+still deny an `--add-write` path.
 
 ### `mantrap doctor`
 
@@ -132,6 +150,14 @@ network:
   dns: host            # host | off (off: only literal-IP entries work)
   allow_private_ips: false  # default deny: blocks SSRF to 127.0.0.0/8,
                            # 10/8, 169.254.169.254, ...
+
+gates:                 # approval gates: the mantrap interlock
+  - match: {exec.path: /usr/bin/curl}  # glob on the binary path
+    action: ask                        # allow | deny | ask
+  - match: {net.domain: "*.internal"}  # case-insensitive glob
+    action: deny
+  - match: {fs.write: /data}          # absolute path prefix
+    action: ask
 ```
 
 Rules: paths must be absolute, must exist, and must not escape via
@@ -227,6 +253,62 @@ Operational notes:
   default `init` template provides `/usr`). Every proxied
   request appends a `net.allow` / `net.deny` record to the audit
   log (`~/.mantrap/audit.log`, or `$MANTRAP_DATA_DIR/audit.log`).
+
+## Approval gates
+
+The mantrap interlock: like the physical mantrap's two doors,
+the second door opens only on approval. A `gates:` policy block
+lists rules; each rule matches one kind of action and decides it
+**before** it happens:
+
+```yaml
+gates:
+  - match: {exec.path: /usr/bin/curl}  # glob on the binary path
+    action: ask
+    description: "let the agent fetch with curl?"  # shown in the prompt
+  - match: {net.domain: "*.internal"}  # case-insensitive glob
+    action: deny
+  - match: {fs.write: /data}          # absolute path prefix
+    action: ask
+```
+
+Rules evaluate in policy order; **the first match wins**
+(firewall order — put specific allows before broad asks). The
+three match kinds:
+
+- `exec.path`: glob against the binary (`fnmatch`); a bare
+  command like `curl` also matches its `PATH` resolution, so a
+  `/usr/bin/curl` glob catches `curl`. Checked before the
+  sandbox starts.
+- `net.domain`: case-insensitive glob on the request domain.
+  Checked per request by the proxy; a deny surfaces as a 403 to
+  the workload, never as a run failure.
+- `fs.write`: absolute path prefix (`/data` matches `/data`
+  and `/data/x`, not `/database`). Checked against the final
+  mount list — including `exec --add-write` — before the
+  sandbox starts.
+
+Actions: `allow` proceeds (audited), `deny` refuses fail-closed
+with exit 2 (audited), `ask` pauses the workload and prompts on
+the controlling terminal:
+
+```
+[mantrap] let the agent fetch with curl?: exec /usr/bin/curl — allow once / always / deny? [deny]
+```
+
+The workload's process group is SIGSTOP'd while the prompt is
+up and SIGCONT'd after — the agent cannot race the operator's
+answer. Answers: `once`/`o`, `always`/`a` (remembered for the
+run), anything else denies. With no terminal, asks deny
+fail-closed.
+
+`--yes` denies every ask without prompting (for CI);
+`--approve-all` allows every ask (still audited; prints a
+warning on every run and is discouraged for anything
+untrusted). Every decision — allow or deny — appends a
+`gate.allow` / `gate.deny` record to the audit log with the
+rule id and the decider (`rule`, `tty`, `tty-remembered`,
+`flag --yes`, `flag --approve-all`, `no-tty`).
 
 ## Credential broker
 

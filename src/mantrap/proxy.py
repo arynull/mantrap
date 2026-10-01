@@ -341,15 +341,28 @@ class ProxyHandle:
 
 
 class FilteringProxy:
-    """The filtering engine; one instance serves all connections."""
+    """The filtering engine; one instance serves all connections.
 
-    def __init__(self, net_config, audit_append=None):
+    `gate_check`, when given, is a callable `(domain) -> "allow" |
+    "deny"` consulted after the static policy checks pass and before
+    any upstream contact (the approval-gate hook). A denied gate gets
+    the same 403 + `net.deny` path as a policy denial. The hook never
+    breaks the proxy: an exception inside it fails closed to "deny".
+
+    Note on concurrency: an `ask` gate may SIGSTOP the workload while
+    a proxy thread waits on the session's prompt lock; concurrent asks
+    from several proxy threads serialize on that lock and are answered
+    in turn.
+    """
+
+    def __init__(self, net_config, audit_append=None, gate_check=None):
         self.allow_domains = list(net_config.allow_domains)
         self.allow_plain_http = net_config.allow_plain_http
         self.allow_ports = list(net_config.allow_ports)
         self.dns = net_config.dns
         self.allow_private_ips = net_config.allow_private_ips
         self.audit_append = audit_append or append_record
+        self.gate_check = gate_check
 
     def audit(self, *, type: str, domain: str, port: int,
               scheme: str, decision: str, reason: str) -> None:
@@ -444,6 +457,23 @@ class FilteringProxy:
         except OSError:
             pass
 
+    def gate_allows(self, *, domain: str, port: int, scheme: str) -> bool:
+        """Approval-gate check at the upstream choke point.
+
+        Called after the static policy checks pass, before any
+        upstream contact. Returns True to proceed. A "deny" (or a
+        hook exception, fail-closed) is False; the caller emits the
+        standard 403 + net.deny record (the session already wrote
+        its own gate.deny record).
+        """
+        if self.gate_check is None:
+            return True
+        try:
+            decision = self.gate_check(domain)
+        except Exception:  # noqa: BLE001 - fail-closed on a broken hook
+            decision = "deny"
+        return decision != "deny"
+
     def handle_connect(
         self, conn: socket.socket, host: str, port: int
     ) -> None:
@@ -465,6 +495,11 @@ class FilteringProxy:
         if blocked is not None:
             self.deny(conn, domain=strip_brackets(host), port=port,
                       scheme="connect", reason=blocked)
+            return
+        if not self.gate_allows(domain=strip_brackets(host), port=port,
+                                scheme="connect"):
+            self.deny(conn, domain=strip_brackets(host), port=port,
+                      scheme="connect", reason="gate_denied")
             return
         parent = parent_proxy_from_env()
         if parent is not None:
@@ -556,6 +591,10 @@ class FilteringProxy:
         if blocked is not None:
             self.deny(conn, domain=domain, port=port,
                       scheme="http", reason=blocked)
+            return
+        if not self.gate_allows(domain=domain, port=port, scheme="http"):
+            self.deny(conn, domain=domain, port=port,
+                      scheme="http", reason="gate_denied")
             return
         parent = parent_proxy_from_env()
         if parent is not None:
@@ -651,7 +690,8 @@ class FilteringProxy:
                 pass
 
 
-def start_proxy(net_config, data_dir, audit_append=None) -> ProxyHandle:
+def start_proxy(net_config, data_dir, audit_append=None,
+                gate_check=None) -> ProxyHandle:
     """Start the filtering proxy; returns a handle with .tcp_port/.stop().
 
     Listens on 127.0.0.1 (ephemeral TCP port) and on
@@ -675,7 +715,9 @@ def start_proxy(net_config, data_dir, audit_append=None) -> ProxyHandle:
     except OSError:
         pass
 
-    engine = FilteringProxy(net_config, audit_append=audit_append)
+    engine = FilteringProxy(
+        net_config, audit_append=audit_append, gate_check=gate_check
+    )
     stop_event = threading.Event()
 
     tcp_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

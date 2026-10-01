@@ -19,9 +19,11 @@ from pathlib import Path
 
 import yaml
 
+from .gates import GateRule, parse_gates
+
 DEFAULT_TIMEOUT_S = 300
 
-KNOWN_TOP_KEYS = {"fs", "env", "limits", "network", "secrets"}
+KNOWN_TOP_KEYS = {"fs", "env", "limits", "network", "secrets", "gates"}
 KNOWN_FS_KEYS = {"read", "write"}
 KNOWN_ENV_KEYS = {"allow"}
 KNOWN_LIMIT_KEYS = {"timeout", "memory", "cpu_seconds", "nproc"}
@@ -69,6 +71,7 @@ class Policy:
     nproc: int | None = None
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     secrets: dict[str, dict[str, str]] = field(default_factory=dict)
+    gates: list[GateRule] = field(default_factory=list)
     source: str = ""
 
 
@@ -99,6 +102,32 @@ def resolve_policy_path(explicit: str | None) -> Path:
     )
 
 
+def validate_write_path(raw: str, key: str) -> str:
+    """Validate one writable path; return its normalized form.
+
+    Fail-closed on relative paths, ".." components, and
+    nonexistent paths. Shared by the policy parser and the
+    `exec --add-write` CLI flag so both enforce the same rule.
+    """
+    if not os.path.isabs(raw):
+        raise PolicyError(
+            f"policy path must be absolute: {key} entry {raw!r}"
+        )
+    # Reject ".." outright: "resolve outside themselves" is
+    # undecidable textually once symlinks are involved, so any
+    # parent-component is fail-closed rather than normalized away.
+    if ".." in raw.split("/"):
+        raise PolicyError(
+            f"policy path must not contain '..': {key} entry {raw!r}"
+        )
+    normalized = os.path.normpath(raw)
+    if not os.path.exists(normalized):
+        raise PolicyError(
+            f"policy path does not exist: {key} entry {raw!r}"
+        )
+    return normalized
+
+
 def _check_path_list(entries: object, key: str) -> list[str]:
     if entries is None:
         return []
@@ -106,26 +135,7 @@ def _check_path_list(entries: object, key: str) -> list[str]:
         isinstance(e, str) for e in entries
     ):
         raise PolicyError(f"policy key {key!r} must be a list of strings")
-    checked: list[str] = []
-    for raw in entries:
-        if not os.path.isabs(raw):
-            raise PolicyError(
-                f"policy path must be absolute: {key} entry {raw!r}"
-            )
-        # Reject ".." outright: "resolve outside themselves" is
-        # undecidable textually once symlinks are involved, so any
-        # parent-component is fail-closed rather than normalized away.
-        if ".." in raw.split("/"):
-            raise PolicyError(
-                f"policy path must not contain '..': {key} entry {raw!r}"
-            )
-        normalized = os.path.normpath(raw)
-        if not os.path.exists(normalized):
-            raise PolicyError(
-                f"policy path does not exist: {key} entry {raw!r}"
-            )
-        checked.append(normalized)
-    return checked
+    return [validate_write_path(raw, key) for raw in entries]
 
 
 def load_policy(path: Path) -> tuple[Policy, str]:
@@ -321,6 +331,8 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             )
         secrets[name] = {kind: arg}
 
+    gates = parse_gates(data.get("gates"))
+
     policy = Policy(
         fs_read=_check_path_list(fs.get("read"), "fs.read"),
         fs_write=_check_path_list(fs.get("write"), "fs.write"),
@@ -338,6 +350,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             allow_private_ips=allow_private_ips,
         ),
         secrets=secrets,
+        gates=gates,
         source=str(path),
     )
     return policy, digest

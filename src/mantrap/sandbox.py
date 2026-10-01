@@ -141,7 +141,29 @@ def build_bwrap_argv(
     cmd = [bwrap]
     for path in policy.fs_read:
         cmd += ["--ro-bind", path, path]
+    # Tmpfs mounts go before user write-binds: a later --tmpfs /tmp
+    # would otherwise hide any write mount under /tmp, and --bind
+    # needs its destination to exist (created with --dir below).
+    cmd += ["--tmpfs", "/tmp"]
+    cmd += ["--tmpfs", "/dev"]
+    for node in DEV_BINDS:
+        if os.path.exists(node):
+            cmd += ["--dev-bind", node, node]
+    if with_proc:
+        cmd += ["--proc", "/proc"]
     for path in policy.fs_write:
+        # --bind requires the destination to exist. Create every
+        # ancestor (and the path itself when it is a directory);
+        # --dir is idempotent so existing dirs are harmless.
+        ancestors: list[str] = []
+        parent = os.path.dirname(path)
+        while parent not in ("", "/"):
+            ancestors.append(parent)
+            parent = os.path.dirname(parent)
+        for ancestor in reversed(ancestors):
+            cmd += ["--dir", ancestor]
+        if os.path.isdir(path):
+            cmd += ["--dir", path]
         cmd += ["--bind", path, path]
     cmd += ["--unshare-all"]
     if mode == "host":
@@ -156,13 +178,6 @@ def build_bwrap_argv(
         "mantrap",
         "--clearenv",
     ]
-    cmd += ["--tmpfs", "/tmp"]
-    cmd += ["--tmpfs", "/dev"]
-    for node in DEV_BINDS:
-        if os.path.exists(node):
-            cmd += ["--dev-bind", node, node]
-    if with_proc:
-        cmd += ["--proc", "/proc"]
     if mode == "allowlist":
         # --unshare-net stays: the sandbox has no route out. The only
         # reachable TCP endpoint is the relay below, which forwards
@@ -239,7 +254,7 @@ def prlimit_prefix(policy: Policy) -> list[str]:
 
 
 def spawn(
-    argv: list[str], timeout: int | float
+    argv: list[str], timeout: int | float, on_start=None
 ) -> tuple[int, bool, float]:
     """Run argv with a wall-clock timeout.
 
@@ -247,9 +262,27 @@ def spawn(
     then SIGKILL. Returns (exit_code, killed_by_limit, duration_s).
     The child inherits this process's stdio so workload output
     passes through untouched.
+
+    `on_start`, when given, is called with the Popen object right
+    after the child is spawned (used by the gate interlock to
+    capture the process group). If it raises, the child is killed
+    and SandboxError is raised — a broken interlock hook is
+    fail-closed.
     """
     start = time.monotonic()
     proc = subprocess.Popen(argv, start_new_session=True)
+    if on_start is not None:
+        try:
+            on_start(proc)
+        except Exception as exc:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            raise SandboxError(
+                f"gate interlock hook failed ({exc}); failing closed"
+            ) from exc
     try:
         proc.wait(timeout=timeout)
         return proc.returncode, False, time.monotonic() - start
@@ -286,6 +319,7 @@ def run_workload(
     workload: list[str],
     emit_warning=None,
     secrets: dict[str, str] | None = None,
+    gate_session=None,
 ) -> tuple[int, bool, float, bool]:
     """Run the workload exactly once, with the no-/proc fallback.
 
@@ -301,19 +335,40 @@ def run_workload(
     sandbox) and stopped afterwards in a `finally`. In
     `network.mode: host` a stderr warning is emitted on every run.
 
+    `gate_session`, when given, is a `gates.GateSession`:
+    start-time gates (exec.path, fs.write) are evaluated before
+    anything starts (`GateDenied` propagates to the caller), the
+    workload's pgid is captured for the ask interlock, and
+    per-request net.domain gates are enforced by the proxy. A net
+    gate deny surfaces as a 403 to the workload, never as a run
+    failure.
+
     Returns (exit_code, killed_by_limit, duration_s,
     used_proc_fallback).
     """
     mode = policy.network.mode
     if mode == "host":
         _emit(emit_warning, HOST_NET_WARNING)
+    if gate_session is not None:
+        # Start-time gates: evaluated before anything is started.
+        # GateDenied propagates to the caller (cli maps it to exit
+        # 2); the session already wrote its gate.deny audit record.
+        gate_session.check_exec_path(workload[0])
+        gate_session.check_fs_writes(policy.fs_write)
     proxy_handle = None
     if mode == "allowlist":
         if not policy.network.allow_domains:
             _emit(emit_warning, EMPTY_ALLOWLIST_WARNING)
         try:
             proxy_handle = start_proxy(
-                policy.network, data_dir(), audit_append=append_record
+                policy.network,
+                data_dir(),
+                audit_append=append_record,
+                gate_check=(
+                    gate_session.check_net_domain
+                    if gate_session is not None
+                    else None
+                ),
             )
         except OSError as exc:
             raise SandboxError(
@@ -321,17 +376,33 @@ def run_workload(
             ) from exc
     try:
         prefix = prlimit_prefix(policy)
+
+        def _capture_pgid(proc):
+            # Best-effort: the interlock needs the workload's
+            # process group for SIGSTOP/SIGCONT on ask gates.
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pgid = None
+            if gate_session is not None:
+                gate_session.set_pgid(pgid)
+
+        on_start = _capture_pgid if gate_session is not None else None
         if proc_available(bwrap):
             argv = build_bwrap_argv(
                 bwrap, policy, workload, with_proc=True, secrets=secrets
             )
-            code, killed, duration = spawn([*prefix, *argv], policy.timeout)
+            code, killed, duration = spawn(
+                [*prefix, *argv], policy.timeout, on_start=on_start
+            )
             return code, killed, duration, False
         _emit(emit_warning, NO_PROC_WARNING)
         argv = build_bwrap_argv(
             bwrap, policy, workload, with_proc=False, secrets=secrets
         )
-        code, killed, duration = spawn([*prefix, *argv], policy.timeout)
+        code, killed, duration = spawn(
+            [*prefix, *argv], policy.timeout, on_start=on_start
+        )
         return code, killed, duration, True
     finally:
         if proxy_handle is not None:
