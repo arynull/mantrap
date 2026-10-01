@@ -15,16 +15,24 @@ two interlocking doors. Nothing passes until it is authorized.
 ## Install
 
 Requirements: Linux, Python 3.10+, `bubblewrap` (`apt install
-bubblewrap` on Debian/Ubuntu).
+bubblewrap` on Debian/Ubuntu), `rsync` (for snapshots).
+
+From source:
 
 ```sh
-pip install mantrap
+git clone https://github.com/rayanalpha/mantrap
+cd mantrap
+pip install .
 ```
 
-Or from source:
+A PyPI release (`pip install mantrap`) is planned; until then,
+install from source as above.
+
+Verify the install:
 
 ```sh
-pip install .
+mantrap --version   # 1.0.0
+mantrap doctor      # one line per environment check
 ```
 
 ## 5-minute quickstart
@@ -47,6 +55,102 @@ echo "exit: $?"
 Give the workload a writable workspace by adding an absolute path to
 `fs.write` in `mantrap.yaml` — the first entry becomes the working
 directory inside the sandbox.
+
+## Examples
+
+### Run an agent script
+
+```sh
+$ cat > agent.py <<'EOF'
+import json, sys
+print(json.dumps({"agent": "demo", "did": sys.argv[1], "sandboxed": True}))
+EOF
+$ mantrap run -- python3 agent.py "summarize logs"
+{"agent": "demo", "did": "summarize logs", "sandboxed": true}
+```
+
+The run is audit-logged with its exit code and duration:
+
+```sh
+$ mantrap audit --json | python3 -c \
+    "import json,sys; r=json.loads(sys.stdin.readlines()[-1]); \
+     print(r['type'], 'exit', r['exit_code'])"
+run exit 0
+```
+
+### Allowlist network egress (e.g. PyPI)
+
+```yaml
+# pypi.yaml
+network:
+  mode: allowlist
+  allow_domains: [pypi.org, "*.pythonhosted.org"]
+  allow_ports: [443]
+```
+
+The workload reaches only listed domains; everything else gets a
+403 and a `net.deny` audit record. (Transcript below uses a local
+server on loopback with `allow_private_ips: true` — same code
+path, reproducible anywhere.)
+
+```sh
+$ mantrap run --policy pypi.yaml -- \
+    curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:18901/agent.py
+HTTP 200
+$ mantrap run --policy pypi.yaml -- \
+    curl -s -w "\nHTTP %{http_code}\n" http://127.0.0.1:18901/agent.py
+forbidden: not_allowlisted
+
+HTTP 403
+$ mantrap audit --json | python3 -c "
+import json, sys
+for line in sys.stdin:
+    r = json.loads(line)
+    if r.get('type') in ('net.allow', 'net.deny'):
+        print(r['type'], '->', r.get('reason'))" | tail -2
+net.allow -> ok
+net.deny -> not_allowlisted
+```
+
+### Gate a risky tool (curl) behind approval
+
+```yaml
+# gate.yaml
+gates:
+  - match: {exec.path: /usr/bin/curl}
+    action: ask
+    description: "let the workload fetch with curl?"
+```
+
+In CI there is no terminal, so `--yes` denies every ask
+fail-closed — the workload never starts, and the decision is
+audited:
+
+```sh
+$ mantrap run --yes --policy gate.yaml -- curl -s http://example.com
+error: denied by gate-0: exec curl
+$ echo $?
+2
+```
+
+With a terminal, the prompt pauses the workload (`SIGSTOP`)
+until you answer `once` / `always` / `deny`.
+
+### Roll back a bad run
+
+```sh
+$ echo hello > precious.txt
+$ mantrap run --auto-rollback -- sh -c 'echo corrupted > precious.txt && exit 3'
+mantrap: snapshotted workspace -> e7174785/20261001-135544-581999
+mantrap: run failed; workspace rolled back to e7174785/20261001-135544-581999 (1 files)
+$ echo $?
+3
+$ cat precious.txt
+hello
+```
+
+The workload's exit code (3) still propagates; the workspace is
+exactly as it was, verified against the snapshot manifest.
 
 ## Commands
 
@@ -195,6 +299,7 @@ limits:
   # memory: 1073741824   # RLIMIT_AS, bytes (needs prlimit(1))
   # cpu_seconds: 60      # RLIMIT_CPU, seconds (needs prlimit(1))
   # nproc: 64            # RLIMIT_NPROC (needs prlimit(1))
+  seccomp: default  # off | default | strict — syscall denylist (see below)
 
 network:
   mode: none           # none | host | allowlist
@@ -253,6 +358,38 @@ if a private `/proc` is unavailable, the workload runs without
 `/proc` and a warning goes to stderr. This is not a weakening —
 `/proc` is an information source, not a wall; omitting it leaks
 strictly less. `mantrap doctor` reports this as `WARN`.
+
+## Syscall filtering (seccomp)
+
+On top of namespaces, every workload runs under a classic-BPF
+seccomp denylist passed to `bwrap --seccomp`. The blocked call is
+killed with `SIGSYS` — fail-closed, no fallback. Three levels via
+`limits.seccomp`:
+
+- `default` (recommended): blocks the calls that break out of or
+  observe the sandbox — `ptrace`, `process_vm_writev`, `bpf`,
+  `perf_event_open`, `userfaultfd`, `mount`/`umount2`/
+  `pivot_root`, module loading, `kexec`, `reboot`, `swapon`/
+  `swapoff`, clock/hostname changes. Ordinary toolchains
+  (compilers, interpreters, build tools) run fine under it.
+- `strict`: everything in `default`, plus `personality`,
+  `unshare`, `setns`, `process_vm_readv`, the `keyctl` family,
+  `fanotify_init`, and friends. Stronger, but debuggers,
+  profilers, and some language runtimes legitimately need these —
+  expect breakage and use it only for workloads you have tested.
+- `off`: no filter. For exotic runtimes; the namespaces,
+  read-only mounts, and network policy still apply.
+
+The filter is generated deterministically (same level → same
+bytes) and cached at `$MANTRAP_DATA_DIR/seccomp-<level>.bpf`.
+Filters exist for x86_64 and aarch64; any other architecture is a
+fail-closed error, never a silent skip. A blocked syscall shows
+up as the workload dying from `SIGSYS` (exit code 159).
+
+```sh
+$ mantrap run -- python3 -c "import ctypes; ctypes.CDLL(None).ptrace(0,0,0,0)"
+# killed by SIGSYS — exit code 159
+```
 
 ## Network control
 
@@ -436,6 +573,26 @@ taken, and on a non-zero exit you get a rollback hint (or an
 automatic, audit-logged restore with `--auto-rollback`). The
 workload's exit code always propagates.
 
+## Threat model (summary)
+
+mantrap assumes the **workload is hostile** and the **policy
+author is trusted** — a malicious policy is game over by design.
+Namespaces, read-only mounts, the network proxy, seccomp, and
+`RLIMIT_CORE=0` together keep a compromised workload away from
+the host, its secrets, and other runs; the hash-chained,
+signed audit log makes silent history rewrites detectable.
+
+Known residual risks: the kernel is shared (a kernel 0-day breaks
+the model — use a VM if that is in your threat model);
+side-channels are not addressed; secrets in one sandbox are
+visible to every process in that same sandbox (the sandbox is
+the unit of trust); an allowlisted domain is a data-exfil channel
+by definition; DNS rebinding is checked per request only. The
+full analysis, including non-goals, is in
+[`THREAT_MODEL.md`](THREAT_MODEL.md). EU AI Act mapping
+(Art. 12 record-keeping, Art. 14 human oversight — guidance, not
+legal advice) is in [`docs/EU_AI_ACT.md`](docs/EU_AI_ACT.md).
+
 ## Limitations
 
 - **Linux only.** Other platforms get a clear error, not a
@@ -450,6 +607,51 @@ workload's exit code always propagates.
   on disk, in the audit log, or in error output — not invisibility
   from the owning user. The workload's own `/proc/<pid>/environ`
   lives inside the sandbox's PID namespace.
+
+## FAQ
+
+**Why not just use Docker?**
+Docker isolates; mantrap *interlocks*. The difference is the
+approval gates (a human must release the second door), the
+deny-by-default policy with fail-closed preflight, and the
+tamper-evident audit log. If you only need a container, use a
+container.
+
+**Why bubblewrap instead of writing my own namespaces?**
+bwrap is a small, audited, setuid-root-free sandbox runner used
+by Flatpak. Reimplementing namespace setup is where sandbox
+escapes are born; mantrap composes bwrap with policy, proxy,
+seccomp, gates, and audit instead.
+
+**Does `network.mode: host` defeat the sandbox?**
+It keeps the host network namespace — the workload can reach
+the LAN and the internet directly. It is an explicit opt-in
+(every run prints a stderr warning) for workloads that need raw
+sockets; filesystem, seccomp, and process isolation still
+apply. Prefer `allowlist`.
+
+**Can the workload tell it is sandboxed?**
+Yes — and that is fine. Hostname `mantrap`, missing devices,
+no network: these are observable. mantrap is not a honeypot;
+it is a cage.
+
+**What happens if bwrap has a vulnerability?**
+Same as any sandbox with a shared kernel: the model breaks.
+Mitigations in depth — seccomp denylist, read-only mounts,
+no-new-privs posture, and the audit log — raise the cost, but
+track bwrap releases and update.
+
+**How do I rotate the audit signing key?**
+`mantrap keygen --rotate`. The old public key stays in the log
+(`key.rotate` record), so old signatures verify forever. Keep
+`signing.key` (0600) backed up; losing it does not invalidate
+past signatures, but new `sig` records cannot be made.
+
+**Can I run this in CI?**
+Yes: `--yes` denies all `ask` gates without a terminal
+(fail-closed), `--dry-run` validates policy without executing,
+and `doctor` gates the environment. The no-`/proc` fallback
+covers restricted CI containers.
 
 ## License
 

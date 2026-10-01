@@ -9,6 +9,7 @@ except for explicitly allowed variables.
 from __future__ import annotations
 
 import os
+import resource
 import shutil
 import signal
 import subprocess
@@ -16,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import seccomp as _seccomp
 from .audit import append_record
 from .policy import Policy, data_dir
 from .proxy import start_proxy
@@ -135,6 +137,7 @@ def build_bwrap_argv(
     workload: list[str],
     with_proc: bool = True,
     secrets: dict[str, str] | None = None,
+    seccomp_fd: int | None = None,
 ) -> list[str]:
     """Build the bwrap command for a validated policy + workload."""
     mode = policy.network.mode
@@ -178,6 +181,10 @@ def build_bwrap_argv(
         "mantrap",
         "--clearenv",
     ]
+    if seccomp_fd is not None:
+        # The FD is passed open into bwrap via pass_fds; bwrap reads
+        # the classic-BPF program and installs it just before exec.
+        cmd += ["--seccomp", str(seccomp_fd)]
     if mode == "allowlist":
         # --unshare-net stays: the sandbox has no route out. The only
         # reachable TCP endpoint is the relay below, which forwards
@@ -253,8 +260,25 @@ def prlimit_prefix(policy: Policy) -> list[str]:
     return prefix
 
 
+def _no_core_dumps() -> None:
+    """preexec_fn: forbid core dumps in the sandbox process tree.
+
+    Secrets travel in the workload's environment; a core dump would
+    persist them to disk (the write mount or tmpfs) where they
+    outlive the run. Setting both soft and hard RLIMIT_CORE to 0
+    means the workload cannot raise the limit back.
+    """
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (OSError, ValueError):
+        pass
+
+
 def spawn(
-    argv: list[str], timeout: int | float, on_start=None
+    argv: list[str],
+    timeout: int | float,
+    on_start=None,
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[int, bool, float]:
     """Run argv with a wall-clock timeout.
 
@@ -270,7 +294,12 @@ def spawn(
     fail-closed.
     """
     start = time.monotonic()
-    proc = subprocess.Popen(argv, start_new_session=True)
+    proc = subprocess.Popen(
+        argv,
+        start_new_session=True,
+        preexec_fn=_no_core_dumps,
+        pass_fds=pass_fds,
+    )
     if on_start is not None:
         try:
             on_start(proc)
@@ -356,6 +385,7 @@ def run_workload(
         gate_session.check_exec_path(workload[0])
         gate_session.check_fs_writes(policy.fs_write)
     proxy_handle = None
+    seccomp_fd: int | None = None
     if mode == "allowlist":
         if not policy.network.allow_domains:
             _emit(emit_warning, EMPTY_ALLOWLIST_WARNING)
@@ -377,6 +407,18 @@ def run_workload(
     try:
         prefix = prlimit_prefix(policy)
 
+        # Seccomp filter FD: written once per level into the data
+        # dir, opened here, inherited by bwrap via pass_fds, closed
+        # in the finally below. Unknown arch fails closed.
+        if policy.seccomp != "off":
+            try:
+                filt = _seccomp.write_filter_file(
+                    policy.seccomp, data_dir()
+                )
+            except _seccomp.SeccompError as exc:
+                raise SandboxError(str(exc)) from exc
+            seccomp_fd = os.open(filt, os.O_RDONLY)
+
         def _capture_pgid(proc):
             # Best-effort: the interlock needs the workload's
             # process group for SIGSTOP/SIGCONT on ask gates.
@@ -388,22 +430,44 @@ def run_workload(
                 gate_session.set_pgid(pgid)
 
         on_start = _capture_pgid if gate_session is not None else None
+        pass_fds = (seccomp_fd,) if seccomp_fd is not None else ()
         if proc_available(bwrap):
             argv = build_bwrap_argv(
-                bwrap, policy, workload, with_proc=True, secrets=secrets
+                bwrap,
+                policy,
+                workload,
+                with_proc=True,
+                secrets=secrets,
+                seccomp_fd=seccomp_fd,
             )
             code, killed, duration = spawn(
-                [*prefix, *argv], policy.timeout, on_start=on_start
+                [*prefix, *argv],
+                policy.timeout,
+                on_start=on_start,
+                pass_fds=pass_fds,
             )
             return code, killed, duration, False
         _emit(emit_warning, NO_PROC_WARNING)
         argv = build_bwrap_argv(
-            bwrap, policy, workload, with_proc=False, secrets=secrets
+            bwrap,
+            policy,
+            workload,
+            with_proc=False,
+            secrets=secrets,
+            seccomp_fd=seccomp_fd,
         )
         code, killed, duration = spawn(
-            [*prefix, *argv], policy.timeout, on_start=on_start
+            [*prefix, *argv],
+            policy.timeout,
+            on_start=on_start,
+            pass_fds=pass_fds,
         )
         return code, killed, duration, True
     finally:
+        if seccomp_fd is not None:
+            try:
+                os.close(seccomp_fd)
+            except OSError:
+                pass
         if proxy_handle is not None:
             proxy_handle.stop()

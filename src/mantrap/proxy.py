@@ -8,6 +8,12 @@ else gets 403 plus an audit record.
 Decision order per request (allowlist BEFORE any DNS or upstream
 contact, so denied domains are never even resolved):
 
+  0. Cloud metadata blocklist: instance-metadata endpoints are
+     refused with 403 (reason metadata_blocklisted) before the
+     allowlist is even consulted — the blocklist always wins, even
+     over an explicit allowlist entry. This closes the
+     redirect-to-metadata SSRF (a 302 to 169.254.169.254 arrives
+     here as a fresh request and is denied).
   1. Parse the request (CONNECT host:port, or absolute-URI
      http://host[:port]/path when plain HTTP is enabled).
      Unparseable/origin-form requests get 400 and are not audited
@@ -129,6 +135,37 @@ def parse_ip(text: str):
         return ipaddress.ip_address(text)
     except ValueError:
         return None
+
+
+# Cloud instance-metadata endpoints. Checked before the allowlist;
+# the blocklist always wins, even over an explicit allowlist entry.
+# Fetching instance metadata (cloud credentials) is the canonical
+# SSRF payload, so it is never a legitimate workload need.
+_METADATA_IP_LITERALS = frozenset(
+    {
+        ipaddress.ip_address("169.254.169.254"),  # AWS/GCP/Azure/Oracle/IBM/DO
+        ipaddress.ip_address("169.254.169.253"),  # link-local metadata alt
+        ipaddress.ip_address("100.100.100.200"),  # Alibaba Cloud
+        ipaddress.ip_address("fd00:ec2::254"),  # AWS IPv6 metadata
+    }
+)
+_METADATA_NAMES = frozenset(
+    {
+        "metadata.google.internal",  # GCP
+        "metadata.goog",  # GCP short
+        "instance-data",  # GCP legacy
+        "instance-data-compute",  # GCP legacy
+    }
+)
+
+
+def is_metadata_endpoint(host: str) -> bool:
+    """True when host is a cloud instance-metadata endpoint."""
+    normalized = normalize_host(strip_brackets(host))
+    if normalized in _METADATA_NAMES:
+        return True
+    ip = parse_ip(normalized)
+    return ip is not None and ip in _METADATA_IP_LITERALS
 
 
 def domain_allowed(host: str, allow_domains: list[str]) -> bool:
@@ -477,6 +514,10 @@ class FilteringProxy:
     def handle_connect(
         self, conn: socket.socket, host: str, port: int
     ) -> None:
+        if is_metadata_endpoint(host):
+            self.deny(conn, domain=strip_brackets(host), port=port,
+                      scheme="connect", reason="metadata_blocklisted")
+            return
         if not domain_allowed(host, self.allow_domains):
             self.deny(conn, domain=strip_brackets(host), port=port,
                       scheme="connect", reason="not_allowlisted")
@@ -573,6 +614,10 @@ class FilteringProxy:
                      headers: list[tuple[str, str]]) -> None:
         host, port, origin = parse_absolute_uri(target)
         domain = strip_brackets(host)
+        if is_metadata_endpoint(host):
+            self.deny(conn, domain=domain, port=port,
+                      scheme="http", reason="metadata_blocklisted")
+            return
         if not domain_allowed(host, self.allow_domains):
             self.deny(conn, domain=domain, port=port,
                       scheme="http", reason="not_allowlisted")

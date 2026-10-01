@@ -26,7 +26,8 @@ DEFAULT_TIMEOUT_S = 300
 KNOWN_TOP_KEYS = {"fs", "env", "limits", "network", "secrets", "gates"}
 KNOWN_FS_KEYS = {"read", "write"}
 KNOWN_ENV_KEYS = {"allow"}
-KNOWN_LIMIT_KEYS = {"timeout", "memory", "cpu_seconds", "nproc"}
+KNOWN_LIMIT_KEYS = {"timeout", "memory", "cpu_seconds", "nproc", "seccomp"}
+SECCOMP_LEVELS = ("off", "default", "strict")
 NETWORK_MODES = {"none", "host", "allowlist"}
 NETWORK_DNS = {"host", "off"}
 KNOWN_NETWORK_KEYS = {
@@ -69,6 +70,7 @@ class Policy:
     memory: int | None = None
     cpu_seconds: int | None = None
     nproc: int | None = None
+    seccomp: str = "default"
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     secrets: dict[str, dict[str, str]] = field(default_factory=dict)
     gates: list[GateRule] = field(default_factory=list)
@@ -228,6 +230,19 @@ def load_policy(path: Path) -> tuple[Policy, str]:
     if timeout <= 0:
         raise PolicyError("policy key 'limits.timeout' must be positive")
 
+    seccomp = limits.get("seccomp", "default")
+    if seccomp is False:
+        # YAML 1.1 parses an unquoted `off` as boolean False; the
+        # intent is unambiguous, so accept it.
+        seccomp = "off"
+    if not isinstance(seccomp, str) or seccomp not in SECCOMP_LEVELS:
+        raise PolicyError(
+            "policy key 'limits.seccomp' must be one of "
+            f"{list(SECCOMP_LEVELS)} (got {seccomp!r})"
+        )
+
+    network = data.get("network", {})
+
     def _opt_int(key: str) -> int | None:
         value = limits.get(key)
         if value is None:
@@ -238,7 +253,6 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             raise PolicyError(f"policy key 'limits.{key}' must be positive")
         return value
 
-    network = data.get("network", {})
     if network is None:
         network = {}
     if not isinstance(network, dict):
@@ -286,6 +300,9 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             "of port numbers (1-65535)"
         )
     dns = network.get("dns", "host")
+    if dns is False:
+        # YAML 1.1 parses an unquoted `off` as boolean False.
+        dns = "off"
     if dns not in NETWORK_DNS:
         raise PolicyError(
             "policy key 'network.dns' must be one of "
@@ -341,6 +358,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
         memory=_opt_int("memory"),
         cpu_seconds=_opt_int("cpu_seconds"),
         nproc=_opt_int("nproc"),
+        seccomp=seccomp,
         network=NetworkPolicy(
             mode=mode,
             allow_domains=list(allow_domains),
