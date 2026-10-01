@@ -1,0 +1,25 @@
+# .gitignore — mantrap (local-only files are NEVER pushed)
+
+# --- internal ops files (standing user rule) ---
+MISSION.md
+RUNBOOK.md
+SPEC.md
+PROGRESS.md
+ERROR_LOG.md
+prompts/
+
+# --- tests are local-only (standing user rule) ---
+tests/
+
+# --- secrets ---
+.telegram.env
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.ruff_cache/
