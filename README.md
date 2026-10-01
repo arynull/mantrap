@@ -110,6 +110,15 @@ limits:
   # memory: 1073741824   # RLIMIT_AS, bytes (needs prlimit(1))
   # cpu_seconds: 60      # RLIMIT_CPU, seconds (needs prlimit(1))
   # nproc: 64            # RLIMIT_NPROC (needs prlimit(1))
+
+network:
+  mode: none           # none | host | allowlist
+  allow_domains: []    # e.g. [pypi.org, "*.pythonhosted.org"]
+  allow_plain_http: false  # plain http:// through the proxy; default deny
+  allow_ports: [443]   # CONNECT targets restricted to these ports
+  dns: host            # host | off (off: only literal-IP entries work)
+  allow_private_ips: false  # default deny: blocks SSRF to 127.0.0.0/8,
+                           # 10/8, 169.254.169.254, ...
 ```
 
 Rules: paths must be absolute, must exist, and must not escape via
@@ -150,6 +159,60 @@ if a private `/proc` is unavailable, the workload runs without
 `/proc` is an information source, not a wall; omitting it leaks
 strictly less. `mantrap doctor` reports this as `WARN`.
 
+## Network control
+
+`network.mode` defaults to `none`: `--unshare-net`, no route out,
+identical to v0.1. `host` keeps the host network namespace (every
+run prints a stderr warning; explicit opt-in only). `allowlist`
+gives filtered egress through a host-side filtering proxy:
+
+```
+workload --TCP--> 127.0.0.1:18080 --unix-sock--> P1 --allowlisted--> internet
+(sandbox)         (relay R,        ($DATA_DIR/       (filtering
+                   in-sandbox)      proxy.sock)       proxy, host)
+```
+
+Why this is unbypassable without privileges:
+
+- `--unshare-net` stays on: the sandbox has no route anywhere.
+  The relay's loopback port is the *only* reachable TCP endpoint.
+- The relay only splices bytes to P1 over the bind-mounted unix
+  socket; it cannot be reconfigured from inside (and
+  `--cap-drop CAP_NET_ADMIN,CAP_NET_RAW` removes the caps that
+  could change that).
+- P1 checks the allowlist **before** any DNS or upstream contact:
+  exact + `*.suffix` matching (a suffix never matches the bare
+  domain), case-insensitive, IDNA-aware; IP literals only when
+  the literal itself is listed. Misses get 403 and a `net.deny`
+  audit record.
+- Default-deny extras: plain HTTP needs `allow_plain_http: true`;
+  `CONNECT` is restricted to `allow_ports` (default `[443]`);
+  loopback/private/link-local upstream IPs are refused unless
+  `allow_private_ips: true` (this blocks SSRF to
+  `169.254.169.254` and host-local services by default).
+
+Fail-closed in every direction: if the relay can't bind or can't
+reach P1, the workload never starts; if the workload kills the
+relay, its network access dies with it; when the workload exits,
+the sandbox PID namespace (and the relay with it) is reaped.
+
+Operational notes:
+
+- P1 resolves names with the host resolver. `dns: off` refuses
+  hostnames entirely — for fully pinned setups using literal-IP
+  allowlist entries. DNS is re-resolved per request; names whose
+  records change mid-session (rebinding) are checked against the
+  records seen at request time only.
+- If the host itself needs an upstream proxy (`$HTTPS_PROXY`),
+  P1 chains through it. Unset it when testing against host-local
+  servers (with `allow_private_ips: true`), or P1 will ask the
+  corporate proxy for your `localhost`.
+- The relay is a small Python script bind-mounted read-only at
+  `/run/mantrap/relay.py`; the sandbox needs a `python3` (the
+  default `init` template provides `/usr`). Every proxied
+  request appends a `net.allow` / `net.deny` record to the audit
+  log (`~/.mantrap/audit.log`, or `$MANTRAP_DATA_DIR/audit.log`).
+
 ## Limitations
 
 - **Linux only.** Other platforms get a clear error, not a
@@ -157,10 +220,8 @@ strictly less. `mantrap doctor` reports this as `WARN`.
 - **Process isolation, not a VM.** The kernel is shared; kernel
   exploits are out of scope. For hostile-tenant separation, use a
   VM or container runtime with a hardened kernel profile.
-- **No network in v0.1.** Egress control (allowlist proxy) is on
-  the roadmap.
-- Secrets handling in v0.1 is limited to `env.allow` passthrough;
-  a proper credential broker is on the roadmap.
+- Secrets handling is limited to `env.allow` passthrough; a
+  proper credential broker is on the roadmap (v0.3).
 
 ## License
 

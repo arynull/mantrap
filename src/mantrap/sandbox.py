@@ -1,8 +1,9 @@
 """bubblewrap sandbox construction and execution.
 
 The sandbox is deny-by-default: only policy-listed filesystem paths
-are bound in, the network is always unshared, and the environment is
-cleared except for explicitly allowed variables.
+are bound in, the network is unshared unless the policy's network
+section explicitly allows otherwise, and the environment is cleared
+except for explicitly allowed variables.
 """
 
 from __future__ import annotations
@@ -13,8 +14,11 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-from .policy import Policy
+from .audit import append_record
+from .policy import Policy, data_dir
+from .proxy import start_proxy
 
 BWRAP = "bwrap"
 
@@ -28,6 +32,22 @@ NO_PROC_WARNING = (
     "warning: private /proc unavailable in this environment; "
     "continuing without it (mount/PID/net isolation unaffected)"
 )
+
+HOST_NET_WARNING = (
+    "warning: network.mode=host — the sandbox shares the host "
+    "network stack"
+)
+
+EMPTY_ALLOWLIST_WARNING = (
+    "warning: network allowlist is empty — all egress will be denied"
+)
+
+# In-sandbox relay endpoint (fixed loopback port, per SPEC).
+RELAY_PORT = 18080
+RELAY_SOCK_PATH = "/run/mantrap/proxy.sock"
+RELAY_SCRIPT_PATH = "/run/mantrap/relay.py"
+RELAY_MOUNT_DIR = "/run/mantrap"
+RELAY_URL = f"http://127.0.0.1:{RELAY_PORT}"
 
 # Exit code used when a resource limit (wall-clock timeout) kills the
 # workload. 124 mirrors the conventional timeout(1) code so a limit
@@ -104,18 +124,28 @@ def proc_available(bwrap: str) -> bool:
     return probe_userns(bwrap, with_proc=True)
 
 
+def relay_host_path() -> str:
+    """Host path of relay.py (bind-mounted read-only into the sandbox)."""
+    return str(Path(__file__).with_name("relay.py"))
+
+
 def build_bwrap_argv(
     bwrap: str, policy: Policy, workload: list[str], with_proc: bool = True
 ) -> list[str]:
     """Build the bwrap command for a validated policy + workload."""
+    mode = policy.network.mode
     cmd = [bwrap]
     for path in policy.fs_read:
         cmd += ["--ro-bind", path, path]
     for path in policy.fs_write:
         cmd += ["--bind", path, path]
+    cmd += ["--unshare-all"]
+    if mode == "host":
+        # Explicit opt-in: keep the host network namespace.
+        cmd += ["--share-net"]
+    else:
+        cmd += ["--unshare-net"]
     cmd += [
-        "--unshare-all",
-        "--unshare-net",
         "--die-with-parent",
         "--new-session",
         "--hostname",
@@ -129,6 +159,15 @@ def build_bwrap_argv(
             cmd += ["--dev-bind", node, node]
     if with_proc:
         cmd += ["--proc", "/proc"]
+    if mode == "allowlist":
+        # --unshare-net stays: the sandbox has no route out. The only
+        # reachable TCP endpoint is the relay below, which forwards
+        # to the host filtering proxy over a bind-mounted socket.
+        cmd += ["--dir", RELAY_MOUNT_DIR]
+        cmd += ["--bind", str(data_dir() / "proxy.sock"), RELAY_SOCK_PATH]
+        cmd += ["--ro-bind", relay_host_path(), RELAY_SCRIPT_PATH]
+        cmd += ["--cap-drop", "CAP_NET_ADMIN"]
+        cmd += ["--cap-drop", "CAP_NET_RAW"]
     for name in policy.env_allow:
         if name not in os.environ:
             raise SandboxError(
@@ -139,11 +178,28 @@ def build_bwrap_argv(
     # A minimal PATH keeps toolchains working when the usual
     # locations are bound in (policies normally include them).
     cmd += ["--setenv", "PATH", "/usr/bin:/bin"]
+    if mode == "allowlist":
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
+                    "https_proxy"):
+            cmd += ["--setenv", var, RELAY_URL]
     if policy.fs_write:
         cmd += ["--chdir", policy.fs_write[0]]
     else:
         cmd += ["--chdir", "/tmp"]
-    cmd += ["--", *workload]
+    if mode == "allowlist":
+        wrapped = [
+            "python3",
+            RELAY_SCRIPT_PATH,
+            "--sock",
+            RELAY_SOCK_PATH,
+            "--listen-port",
+            str(RELAY_PORT),
+            "--",
+            *workload,
+        ]
+        cmd += ["--", *wrapped]
+    else:
+        cmd += ["--", *workload]
     return cmd
 
 
@@ -207,6 +263,14 @@ def spawn(
     return TIMEOUT_EXIT_CODE, True, time.monotonic() - start
 
 
+def _emit(emit_warning, text: str) -> None:
+    """Stderr warning, or the caller's collector when testing."""
+    if emit_warning is None:
+        print(text, file=sys.stderr)
+    else:
+        emit_warning(text + "\n")
+
+
 def run_workload(
     bwrap: str,
     policy: Policy,
@@ -220,18 +284,43 @@ def run_workload(
     cannot be mounted here, the workload runs without it and a
     warning goes to stderr. Omitting /proc leaks strictly less, so
     this is not a fail-closed violation (/proc is an information
-    source, not a wall). Returns (exit_code, killed_by_limit,
-    duration_s, used_proc_fallback).
+    source, not a wall).
+
+    In `network.mode: allowlist` the host filtering proxy is
+    started before bwrap (its socket is bind-mounted into the
+    sandbox) and stopped afterwards in a `finally`. In
+    `network.mode: host` a stderr warning is emitted on every run.
+
+    Returns (exit_code, killed_by_limit, duration_s,
+    used_proc_fallback).
     """
-    prefix = prlimit_prefix(policy)
-    if proc_available(bwrap):
-        argv = build_bwrap_argv(bwrap, policy, workload, with_proc=True)
+    mode = policy.network.mode
+    if mode == "host":
+        _emit(emit_warning, HOST_NET_WARNING)
+    proxy_handle = None
+    if mode == "allowlist":
+        if not policy.network.allow_domains:
+            _emit(emit_warning, EMPTY_ALLOWLIST_WARNING)
+        try:
+            proxy_handle = start_proxy(
+                policy.network, data_dir(), audit_append=append_record
+            )
+        except OSError as exc:
+            raise SandboxError(
+                f"cannot start filtering proxy: {exc}"
+            ) from exc
+    try:
+        prefix = prlimit_prefix(policy)
+        if proc_available(bwrap):
+            argv = build_bwrap_argv(
+                bwrap, policy, workload, with_proc=True
+            )
+            code, killed, duration = spawn([*prefix, *argv], policy.timeout)
+            return code, killed, duration, False
+        _emit(emit_warning, NO_PROC_WARNING)
+        argv = build_bwrap_argv(bwrap, policy, workload, with_proc=False)
         code, killed, duration = spawn([*prefix, *argv], policy.timeout)
-        return code, killed, duration, False
-    if emit_warning is None:
-        print(NO_PROC_WARNING, file=sys.stderr)
-    else:
-        emit_warning(NO_PROC_WARNING + "\n")
-    argv = build_bwrap_argv(bwrap, policy, workload, with_proc=False)
-    code, killed, duration = spawn([*prefix, *argv], policy.timeout)
-    return code, killed, duration, True
+        return code, killed, duration, True
+    finally:
+        if proxy_handle is not None:
+            proxy_handle.stop()

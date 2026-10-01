@@ -20,14 +20,37 @@ import yaml
 
 DEFAULT_TIMEOUT_S = 300
 
-KNOWN_TOP_KEYS = {"fs", "env", "limits"}
+KNOWN_TOP_KEYS = {"fs", "env", "limits", "network"}
 KNOWN_FS_KEYS = {"read", "write"}
 KNOWN_ENV_KEYS = {"allow"}
 KNOWN_LIMIT_KEYS = {"timeout", "memory", "cpu_seconds", "nproc"}
+NETWORK_MODES = {"none", "host", "allowlist"}
+NETWORK_DNS = {"host", "off"}
+KNOWN_NETWORK_KEYS = {
+    "mode",
+    "allow_domains",
+    "allow_plain_http",
+    "allow_ports",
+    "dns",
+    "allow_private_ips",
+}
+DEFAULT_ALLOW_PORTS = [443]
 
 
 class PolicyError(ValueError):
     """Raised when a policy file is missing or invalid."""
+
+
+@dataclass
+class NetworkPolicy:
+    """Validated `network` section of the policy."""
+
+    mode: str = "none"
+    allow_domains: list[str] = field(default_factory=list)
+    allow_plain_http: bool = False
+    allow_ports: list[int] = field(default_factory=lambda: [443])
+    dns: str = "host"
+    allow_private_ips: bool = False
 
 
 @dataclass
@@ -41,6 +64,7 @@ class Policy:
     memory: int | None = None
     cpu_seconds: int | None = None
     nproc: int | None = None
+    network: NetworkPolicy = field(default_factory=NetworkPolicy)
     source: str = ""
 
 
@@ -200,6 +224,65 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             raise PolicyError(f"policy key 'limits.{key}' must be positive")
         return value
 
+    network = data.get("network", {})
+    if network is None:
+        network = {}
+    if not isinstance(network, dict):
+        raise PolicyError("policy key 'network' must be a mapping")
+    unknown_net = set(network) - KNOWN_NETWORK_KEYS
+    if unknown_net:
+        raise PolicyError(
+            "unknown policy key(s) under 'network': "
+            + ", ".join(sorted(map(str, unknown_net)))
+        )
+    mode = network.get("mode", "none")
+    if mode not in NETWORK_MODES:
+        raise PolicyError(
+            "policy key 'network.mode' must be one of "
+            f"{sorted(NETWORK_MODES)} (got {mode!r})"
+        )
+    allow_domains = network.get("allow_domains", [])
+    if allow_domains is None:
+        allow_domains = []
+    if not isinstance(allow_domains, list) or not all(
+        isinstance(e, str) and e for e in allow_domains
+    ):
+        raise PolicyError(
+            "policy key 'network.allow_domains' must be a list "
+            "of non-empty strings"
+        )
+    allow_plain_http = network.get("allow_plain_http", False)
+    if not isinstance(allow_plain_http, bool):
+        raise PolicyError(
+            "policy key 'network.allow_plain_http' must be a boolean"
+        )
+    allow_ports = network.get("allow_ports", [443])
+    if allow_ports is None:
+        allow_ports = [443]
+    if (
+        not isinstance(allow_ports, list)
+        or not allow_ports
+        or any(
+            isinstance(p, bool) or not isinstance(p, int) or not 1 <= p <= 65535
+            for p in allow_ports
+        )
+    ):
+        raise PolicyError(
+            "policy key 'network.allow_ports' must be a non-empty list "
+            "of port numbers (1-65535)"
+        )
+    dns = network.get("dns", "host")
+    if dns not in NETWORK_DNS:
+        raise PolicyError(
+            "policy key 'network.dns' must be one of "
+            f"{sorted(NETWORK_DNS)} (got {dns!r})"
+        )
+    allow_private_ips = network.get("allow_private_ips", False)
+    if not isinstance(allow_private_ips, bool):
+        raise PolicyError(
+            "policy key 'network.allow_private_ips' must be a boolean"
+        )
+
     policy = Policy(
         fs_read=_check_path_list(fs.get("read"), "fs.read"),
         fs_write=_check_path_list(fs.get("write"), "fs.write"),
@@ -208,6 +291,14 @@ def load_policy(path: Path) -> tuple[Policy, str]:
         memory=_opt_int("memory"),
         cpu_seconds=_opt_int("cpu_seconds"),
         nproc=_opt_int("nproc"),
+        network=NetworkPolicy(
+            mode=mode,
+            allow_domains=list(allow_domains),
+            allow_plain_http=allow_plain_http,
+            allow_ports=list(allow_ports),
+            dns=dns,
+            allow_private_ips=allow_private_ips,
+        ),
         source=str(path),
     )
     return policy, digest

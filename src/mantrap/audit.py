@@ -1,9 +1,9 @@
 """Audit log: one JSON object per line, forward-compatible schema.
 
-Each sandboxed run appends exactly one record. Writes are atomic
-(write a temp file in the same directory, then rename) so a crash
-mid-write cannot leave a half-written line. The ``v`` field keeps
-the schema forward-compatible for later hash-chaining.
+Run records (type "run") use the exact v0.1 schema. Network records
+(type "net.allow" / "net.deny") share the same atomic append path.
+The ``v`` field keeps the schema forward-compatible for later
+hash-chaining.
 """
 
 from __future__ import annotations
@@ -12,10 +12,49 @@ import json
 import os
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .policy import data_dir
 
 AUDIT_FILENAME = "audit.log"
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def append_record(record: dict, directory: Path | None = None) -> dict:
+    """Atomically append one JSON record to the audit log.
+
+    Uses write-temp-then-rename so a crash cannot leave a
+    half-written line. Raises OSError when the record cannot be
+    persisted (callers treat that as fail-closed).
+    """
+    target_dir = directory if directory is not None else data_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / AUDIT_FILENAME
+    existing = b""
+    if target.exists():
+        existing = target.read_bytes()
+    line = (json.dumps(record) + "\n").encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target_dir), prefix="audit.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if existing:
+                handle.write(existing.decode("utf-8"))
+            handle.write(line.decode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return record
 
 
 def append_run_record(
@@ -34,7 +73,7 @@ def append_run_record(
     """
     record = {
         "v": 1,
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": utc_now_iso(),
         "type": "run",
         "policy_sha256": policy_sha256,
         "argv": list(argv),
@@ -44,28 +83,4 @@ def append_run_record(
         "killed_by_limit": killed_by_limit,
         "proc_fallback": proc_fallback,
     }
-    directory = data_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / AUDIT_FILENAME
-    existing = b""
-    if target.exists():
-        existing = target.read_bytes()
-    line = (json.dumps(record) + "\n").encode("utf-8")
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(directory), prefix="audit.", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            if existing:
-                handle.write(existing.decode("utf-8"))
-            handle.write(line.decode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, target)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-    return record
+    return append_record(record)
