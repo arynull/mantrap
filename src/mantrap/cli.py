@@ -103,6 +103,8 @@ limits:
   # allow_plain_http: false
   # allow_ports: [443]
   # dns: host
+  # dns_pin_ttl: 60        # seconds a resolved name stays pinned to
+  #                        # its IP set (anti-DNS-rebinding); 0 disables
   # allow_private_ips: false
 
 #gates:

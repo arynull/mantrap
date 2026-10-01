@@ -36,11 +36,16 @@ KNOWN_NETWORK_KEYS = {
     "allow_plain_http",
     "allow_ports",
     "dns",
+    "dns_pin_ttl",
     "allow_private_ips",
 }
 SECRET_SOURCES = ("env", "file", "keyring")
 SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_ALLOW_PORTS = [443]
+# Seconds a resolved name stays pinned to the IP set of its first
+# lookup. 0 disables pinning (per-request resolution). The minimum
+# meaningful non-zero value is 1 second.
+DEFAULT_DNS_PIN_TTL = 60
 
 
 class PolicyError(ValueError):
@@ -56,6 +61,7 @@ class NetworkPolicy:
     allow_plain_http: bool = False
     allow_ports: list[int] = field(default_factory=lambda: [443])
     dns: str = "host"
+    dns_pin_ttl: int = DEFAULT_DNS_PIN_TTL
     allow_private_ips: bool = False
 
 
@@ -308,6 +314,22 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             "policy key 'network.dns' must be one of "
             f"{sorted(NETWORK_DNS)} (got {dns!r})"
         )
+    dns_pin_ttl = network.get("dns_pin_ttl", DEFAULT_DNS_PIN_TTL)
+    if dns_pin_ttl is None:
+        dns_pin_ttl = DEFAULT_DNS_PIN_TTL
+    if isinstance(dns_pin_ttl, bool) or not isinstance(
+        dns_pin_ttl, int
+    ):
+        raise PolicyError(
+            "policy key 'network.dns_pin_ttl' must be a "
+            "non-negative integer number of seconds (default 60, "
+            f"minimum 1, 0 disables pinning) (got {dns_pin_ttl!r})"
+        )
+    if dns_pin_ttl < 0:
+        raise PolicyError(
+            "policy key 'network.dns_pin_ttl' must be >= 0 "
+            "(0 disables DNS pinning)"
+        )
     allow_private_ips = network.get("allow_private_ips", False)
     if not isinstance(allow_private_ips, bool):
         raise PolicyError(
@@ -365,6 +387,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             allow_plain_http=allow_plain_http,
             allow_ports=list(allow_ports),
             dns=dns,
+            dns_pin_ttl=dns_pin_ttl,
             allow_private_ips=allow_private_ips,
         ),
         secrets=secrets,

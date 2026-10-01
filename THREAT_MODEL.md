@@ -36,6 +36,7 @@ you trust the sandbox.
 | Read-only binds for `fs.read` | Mounted inputs cannot be modified (`EROFS`). |
 | Network namespace (`--unshare-net`, default) | No sockets at all in `network.mode: none`. |
 | Filtering egress proxy (allowlist mode) | Only allowlisted domains/ports; private-IP guard; cloud-metadata endpoints blocklisted even over an explicit allowlist entry. A 302 to `169.254.169.254` arrives as a fresh request and is denied. |
+| DNS pinning (`network.dns_pin_ttl`, default 60s) | A name is resolved once and its IP set is reused, without re-resolving, for every later request inside the TTL — so a resolver that answers benignly first and flips afterwards cannot move the workload mid-window. Bounded to 512 pinned hosts. |
 | Seccomp-BPF denylist (`limits.seccomp`, default on) | `ptrace`, `process_vm_writev`, `bpf`, `perf_event_open`, `userfaultfd`, mount/module/reboot/clock syscalls → the caller is killed with `SIGSYS`. Namespace games (`unshare`, `setns`, `personality`) additionally blocked under `strict`. |
 | `RLIMIT_CORE=0` (hard) | A crashed workload cannot persist its environment (which carries secrets) to a core file. |
 | Process-group kill on timeout | `SIGTERM` to the whole group, 5s grace, then `SIGKILL`. A double-forking workload that ignores `SIGTERM` still dies (verified by `test_timeout_kills_double_forking_workload`). |
@@ -57,9 +58,21 @@ you trust the sandbox.
   The sandbox boundary is the unit of trust for secrets — do not
   run mutually untrusted processes in one sandbox and expect
   secret separation between them.
-- **DNS rebinding.** The proxy resolves and checks the records
-  seen at request time; a name whose records change mid-session
-  is only checked per request.
+- **DNS rebinding is bounded, not eliminated.**
+  `network.dns_pin_ttl` (default 60s) pins a name to the IP set
+  of its first lookup, so the cheap attack — answer benignly,
+  flip the next query — fails inside the window. The honest
+  residual: an attacker who controls the very first answer, or
+  who simply waits out the TTL, can still redirect the workload
+  to a different *public* address on the next window. That is
+  the same position as any DNS client; a longer TTL widens the
+  window in which a stale answer is used, a shorter one narrows
+  it. Rebinding to *internal* addresses stays denied
+  regardless (private-IP guard + metadata blocklist), and the
+  pin map is per-process (LRU, 512 entries) and dies with the
+  proxy. Under parent-proxy chaining (`$HTTPS_PROXY`) the parent
+  does the resolving; the host-side pin covers only mantrap's own
+  lookups.
 - **Covert channels via allowed egress.** An allowlisted domain
   is a data-exfiltration channel by definition. Allowlists are
   trust decisions, not walls.

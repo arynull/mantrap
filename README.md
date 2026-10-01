@@ -31,7 +31,7 @@ install from source as above.
 Verify the install:
 
 ```sh
-mantrap --version   # 1.0.0
+mantrap --version   # 1.1.0
 mantrap doctor      # one line per environment check
 ```
 
@@ -307,6 +307,9 @@ network:
   allow_plain_http: false  # plain http:// through the proxy; default deny
   allow_ports: [443]   # CONNECT targets restricted to these ports
   dns: host            # host | off (off: only literal-IP entries work)
+  dns_pin_ttl: 60      # seconds a resolved name stays pinned to its IP
+                       # set (anti-DNS-rebinding); integer >= 0, 0 disables
+                       # pinning (per-request resolution, the old behavior)
   allow_private_ips: false  # default deny: blocks SSRF to 127.0.0.0/8,
                            # 10/8, 169.254.169.254, ...
 
@@ -432,9 +435,15 @@ Operational notes:
 
 - P1 resolves names with the host resolver. `dns: off` refuses
   hostnames entirely — for fully pinned setups using literal-IP
-  allowlist entries. DNS is re-resolved per request; names whose
-  records change mid-session (rebinding) are checked against the
-  records seen at request time only.
+  allowlist entries. Otherwise each name is resolved once and
+  the IP set is pinned for `network.dns_pin_ttl` seconds
+  (default 60): later requests reuse the pinned set without
+  re-resolving, then the pin expires and the name is looked up
+  fresh. This blocks the cheap DNS-rebinding flip; it does not
+  stop an attacker who controls the first answer or who waits
+  out the TTL — same as any DNS client. The guard order is
+  untouched (private-IP guard sees the pinned set either way),
+  and the pin map holds at most 512 hosts.
 - If the host itself needs an upstream proxy (`$HTTPS_PROXY`),
   P1 chains through it. Unset it when testing against host-local
   servers (with `allow_private_ips: true`), or P1 will ask the
@@ -587,7 +596,10 @@ the model — use a VM if that is in your threat model);
 side-channels are not addressed; secrets in one sandbox are
 visible to every process in that same sandbox (the sandbox is
 the unit of trust); an allowlisted domain is a data-exfil channel
-by definition; DNS rebinding is checked per request only. The
+by definition; DNS rebinding is bounded by a per-name pin
+(`dns_pin_ttl`, default 60s) but not eliminated — an attacker who
+controls the first answer, or who waits out the TTL, can still
+redirect to another public address. The
 full analysis, including non-goals, is in
 [`THREAT_MODEL.md`](THREAT_MODEL.md). EU AI Act mapping
 (Art. 12 record-keeping, Art. 14 human oversight — guidance, not

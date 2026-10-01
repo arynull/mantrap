@@ -30,7 +30,12 @@ contact, so denied domains are never even resolved):
   5. Name resolution on the host side (unless dns is "off", in
      which case hostnames are refused with 403 reason
      dns_disabled and only listed IP literals work). Unresolvable
-     names get 403 (reason resolve_failed).
+     names get 403 (reason resolve_failed). Resolved names are DNS
+     pinned for `network.dns_pin_ttl` seconds (default 60): the
+     first lookup's IP set is reused, without re-resolving, for
+     every later request to the same host until the pin expires.
+     Pinning changes only WHEN resolution happens, never what is
+     checked (step 6 sees the same IP set either way).
   6. Private-IP guard: any resolved/special IP (loopback,
      private, link-local, multicast, reserved, unspecified) is
      refused with 403 (reason private_ip) unless
@@ -47,6 +52,9 @@ lowercase https_proxy), upstream TCP goes to the parent instead:
 CONNECT is re-issued to the parent, plain HTTP is forwarded with
 the absolute URI intact. Parent-proxy authentication is out of
 scope (credentials in the parent URL are ignored, never logged).
+DNS pinning covers the host's own lookups only: under chaining the
+parent resolves the name itself, and the parent is trusted to do
+what it does with it.
 
 Audit: every attributable request appends one record via the
 given callback: {"v": 1, "ts", "type": "net.allow"/"net.deny",
@@ -60,9 +68,15 @@ parsed: after headers, bytes splice in both directions until EOF,
 so each proxied connection carries a single request/response
 exchange and then closes.
 
-Residual risk: DNS is re-resolved per request on the host side,
-so a name whose records change mid-session (DNS rebinding) is
-checked against the records seen at request time only.
+Residual risk (DNS): pinning closes the cheap rebinding attack —
+a name that answers with a benign IP and flips on the next lookup
+inside the TTL is still connected to the address checked at the
+start of the TTL. It is not a hard guarantee: an attacker who
+waits out `dns_pin_ttl` (or who controls the very first answer)
+can still redirect the workload to a different public IP, exactly
+as with any DNS client. Longer TTLs widen the window in which a
+stale answer is used; shorter ones narrow it. The pin map is
+per-process and lives only as long as the proxy.
 """
 
 from __future__ import annotations
@@ -71,6 +85,8 @@ import ipaddress
 import os
 import socket
 import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -83,6 +99,45 @@ CONNECT_TIMEOUT_S = 10.0
 IDLE_TIMEOUT_S = 60.0
 
 RELAY_LISTEN = "127.0.0.1:18080"
+
+# Upper bound on the number of distinct pinned hosts kept in memory.
+# A workload can otherwise grow proxy memory without limit by
+# hammering many different allowlisted names.
+PIN_MAP_MAX = 512
+# Seconds a resolved name stays pinned to the IP set of its first
+# lookup. 0 disables pinning (per-request resolution). The policy
+# loader rejects anything that is not a non-negative integer.
+DEFAULT_DNS_PIN_TTL = 60
+
+
+def validate_pin_ttl(value) -> float:
+    """Return dns_pin_ttl as a number of seconds, or raise ValueError.
+
+    Defence in depth for hand-built NetworkPolicy objects: the
+    policy loader is the loud, user-facing rejection, this keeps a
+    programmatically bad value from silently disabling (or
+    inverting) pinning inside the engine.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"dns_pin_ttl must be a non-negative number (got {value!r})"
+        )
+    if value < 0:
+        raise ValueError(
+            f"dns_pin_ttl must be >= 0, 0 disables pinning (got {value!r})"
+        )
+    return float(value)
+
+
+def system_resolve(host: str) -> list[str]:
+    """Host-side DNS lookup: sorted, de-duplicated IP strings.
+
+    Raises socket.gaierror when the name has no records. Tests
+    inject their own resolver (see FilteringProxy.resolver_fn)
+    instead of touching the network.
+    """
+    infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    return sorted({str(info[4][0]) for info in infos})
 
 HOP_BY_HOP = frozenset(
     {
@@ -355,6 +410,10 @@ class ProxyHandle:
     _stop_event: threading.Event = field(repr=False)
     _listeners: list = field(default_factory=list, repr=False)
     _accept_threads: list = field(default_factory=list, repr=False)
+    # The filtering engine, exposed for tests (pin-map inspection,
+    # resolver injection) and diagnostics. Not used by production
+    # code paths.
+    engine: FilteringProxy | None = field(default=None, repr=False)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -377,6 +436,72 @@ class ProxyHandle:
             pass
 
 
+class DnsPinMap:
+    """TTL-bounded DNS pin cache: normalized host -> (ips, expires_at).
+
+    Addresses are stored as text (the same form the guard checks and
+    `create_connection` dials), the expiry is `time.monotonic()`-based
+    so a wall-clock jump cannot strand a pin. Read and write are
+    lock-guarded — the proxy serves connections on daemon threads —
+    and the map is LRU-bounded to `max_entries` (PIN_MAP_MAX) so a
+    workload cannot grow proxy memory by hammering many distinct
+    allowlisted names.
+
+    Only pin lookups live here: the resolve/guard/connect pipeline
+    stays in FilteringProxy.resolve(), so pinning changes WHEN a
+    name is resolved, never what is checked afterwards.
+    """
+
+    def __init__(self, max_entries: int = PIN_MAP_MAX) -> None:
+        self._pins: OrderedDict[str, tuple[list[str], float]] = (
+            OrderedDict()
+        )
+        self._lock = threading.Lock()
+        self.max_entries = max_entries
+
+    def get(self, key: str) -> list[str] | None:
+        """Fresh pinned IP set, or None when absent or expired.
+
+        A hit refreshes the entry's recency (LRU); an expired entry
+        is dropped on sight so a dead pin can never be served twice.
+        """
+        now = time.monotonic()
+        with self._lock:
+            entry = self._pins.get(key)
+            if entry is None:
+                return None
+            ips, expires_at = entry
+            if expires_at <= now:
+                del self._pins[key]
+                return None
+            self._pins.move_to_end(key)
+            return list(ips)
+
+    def set(self, key: str, ips: list[str], ttl: float) -> None:
+        """Pin `ips` for `key` for `ttl` seconds; evict oldest-first.
+
+        Expired entries are swept first: a workload that churns
+        through short-TTL names must not leave a full map of dead
+        pins behind, only live ones.
+        """
+        now = time.monotonic()
+        with self._lock:
+            for stale in [
+                host
+                for host, (_ips, expires_at) in self._pins.items()
+                if expires_at <= now
+            ]:
+                del self._pins[stale]
+            self._pins[key] = (list(ips), now + ttl)
+            self._pins.move_to_end(key)
+            while len(self._pins) > self.max_entries:
+                self._pins.popitem(last=False)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._pins)
+
+
 class FilteringProxy:
     """The filtering engine; one instance serves all connections.
 
@@ -392,14 +517,23 @@ class FilteringProxy:
     in turn.
     """
 
-    def __init__(self, net_config, audit_append=None, gate_check=None):
+    def __init__(self, net_config, audit_append=None, gate_check=None,
+                 resolver_fn=None, pin_map=None):
         self.allow_domains = list(net_config.allow_domains)
         self.allow_plain_http = net_config.allow_plain_http
         self.allow_ports = list(net_config.allow_ports)
         self.dns = net_config.dns
+        # The policy loader rejects a bad value; this is the same
+        # fail-closed rule applied to hand-built configs.
+        self.dns_pin_ttl = validate_pin_ttl(
+            getattr(net_config, "dns_pin_ttl", DEFAULT_DNS_PIN_TTL)
+        )
         self.allow_private_ips = net_config.allow_private_ips
         self.audit_append = audit_append or append_record
         self.gate_check = gate_check
+        # Indirection for testability: no real DNS in the tests.
+        self.resolver_fn = resolver_fn or system_resolve
+        self.pins = pin_map if pin_map is not None else DnsPinMap()
 
     def audit(self, *, type: str, domain: str, port: int,
               scheme: str, decision: str, reason: str) -> None:
@@ -437,22 +571,40 @@ class FilteringProxy:
             pass
 
     def resolve(self, host: str) -> tuple[list[str] | None, str | None]:
-        """Resolve host to IP strings; (None, reason) when refused."""
+        """Resolve host to IP strings; (None, reason) when refused.
+
+        DNS pinning (anti-rebinding): a name is resolved once and
+        its IP set is reused for `dns_pin_ttl` seconds, so a
+        resolver that answers benignly first and flips to another
+        address afterwards cannot move the workload mid-TTL. The
+        returned set is what the private-IP guard checks and what
+        `connect_upstream` dials, so the guard order is untouched —
+        only the moment of resolution moved.
+
+        IP literals never reach the pin map (they are their own
+        answer, and there is no TOCTOU window to close), and
+        `dns: off` resolves nothing at all.
+        """
         bare = strip_brackets(host)
-        literal = parse_ip(normalize_host(bare))
+        normalized = normalize_host(bare)
+        literal = parse_ip(normalized)
         if literal is not None:
             return [str(literal)], None
         if self.dns == "off":
             return None, "dns_disabled"
+        if self.dns_pin_ttl > 0:
+            pinned = self.pins.get(normalized)
+            if pinned is not None:
+                return pinned, None
         try:
-            infos = socket.getaddrinfo(
-                normalize_host(bare), None, type=socket.SOCK_STREAM
-            )
+            ips = self.resolver_fn(normalized)
         except socket.gaierror:
             return None, "resolve_failed"
-        ips = sorted({str(info[4][0]) for info in infos})
+        ips = sorted({str(text) for text in ips})
         if not ips:
             return None, "resolve_failed"
+        if self.dns_pin_ttl > 0:
+            self.pins.set(normalized, ips, self.dns_pin_ttl)
         return ips, None
 
     def guard(self, ips: list[str]) -> str | None:
@@ -736,13 +888,16 @@ class FilteringProxy:
 
 
 def start_proxy(net_config, data_dir, audit_append=None,
-                gate_check=None) -> ProxyHandle:
+                gate_check=None, resolver_fn=None) -> ProxyHandle:
     """Start the filtering proxy; returns a handle with .tcp_port/.stop().
 
     Listens on 127.0.0.1 (ephemeral TCP port) and on
     <data_dir>/proxy.sock (unix socket, data dir created mode 700
     when missing). net_config carries mode, allow_domains,
-    allow_plain_http, allow_ports, dns, allow_private_ips.
+    allow_plain_http, allow_ports, dns, dns_pin_ttl,
+    allow_private_ips. `resolver_fn`, when given, replaces the
+    host-resolver lookup (tests only — production always resolves
+    via the host).
     """
     if getattr(net_config, "mode", "allowlist") != "allowlist":
         raise ValueError(
@@ -761,7 +916,10 @@ def start_proxy(net_config, data_dir, audit_append=None,
         pass
 
     engine = FilteringProxy(
-        net_config, audit_append=audit_append, gate_check=gate_check
+        net_config,
+        audit_append=audit_append,
+        gate_check=gate_check,
+        resolver_fn=resolver_fn,
     )
     stop_event = threading.Event()
 
@@ -806,4 +964,5 @@ def start_proxy(net_config, data_dir, audit_append=None,
         _stop_event=stop_event,
         _listeners=[tcp_listener, unix_listener],
         _accept_threads=threads,
+        engine=engine,
     )
