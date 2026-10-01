@@ -130,7 +130,11 @@ def relay_host_path() -> str:
 
 
 def build_bwrap_argv(
-    bwrap: str, policy: Policy, workload: list[str], with_proc: bool = True
+    bwrap: str,
+    policy: Policy,
+    workload: list[str],
+    with_proc: bool = True,
+    secrets: dict[str, str] | None = None,
 ) -> list[str]:
     """Build the bwrap command for a validated policy + workload."""
     mode = policy.network.mode
@@ -178,6 +182,11 @@ def build_bwrap_argv(
     # A minimal PATH keeps toolchains working when the usual
     # locations are bound in (policies normally include them).
     cmd += ["--setenv", "PATH", "/usr/bin:/bin"]
+    # Secrets are injected after env.allow so they cannot be shadowed;
+    # policy validation forbids a NAME in both places anyway.
+    resolved = secrets or {}
+    for name in sorted(resolved):
+        cmd += ["--setenv", name, resolved[name]]
     if mode == "allowlist":
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
                     "https_proxy"):
@@ -276,6 +285,7 @@ def run_workload(
     policy: Policy,
     workload: list[str],
     emit_warning=None,
+    secrets: dict[str, str] | None = None,
 ) -> tuple[int, bool, float, bool]:
     """Run the workload exactly once, with the no-/proc fallback.
 
@@ -313,12 +323,14 @@ def run_workload(
         prefix = prlimit_prefix(policy)
         if proc_available(bwrap):
             argv = build_bwrap_argv(
-                bwrap, policy, workload, with_proc=True
+                bwrap, policy, workload, with_proc=True, secrets=secrets
             )
             code, killed, duration = spawn([*prefix, *argv], policy.timeout)
             return code, killed, duration, False
         _emit(emit_warning, NO_PROC_WARNING)
-        argv = build_bwrap_argv(bwrap, policy, workload, with_proc=False)
+        argv = build_bwrap_argv(
+            bwrap, policy, workload, with_proc=False, secrets=secrets
+        )
         code, killed, duration = spawn([*prefix, *argv], policy.timeout)
         return code, killed, duration, True
     finally:

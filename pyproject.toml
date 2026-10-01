@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mantrap"
-version = "0.2.0"
+version = "0.3.0"
 description = "OS-enforced sandbox CLI: run untrusted commands inside a deny-by-default bubblewrap sandbox"
 readme = "README.md"
 license = { text = "MIT" }

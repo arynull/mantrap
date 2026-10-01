@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 from pathlib import Path
 
@@ -16,11 +17,19 @@ from .policy import (
 )
 from .sandbox import (
     SandboxError,
+    build_bwrap_argv,
     find_bwrap,
     preflight,
     probe_userns,
     proc_available,
     run_workload,
+)
+from .secrets import (
+    SecretsError,
+    mask_argv,
+    mask_value,
+    resolve_secrets,
+    scrub_argv,
 )
 
 INIT_TEMPLATE = """\
@@ -28,7 +37,8 @@ INIT_TEMPLATE = """\
 #
 # Nothing is visible inside the sandbox unless it is listed here:
 # filesystem paths (fs.read / fs.write), environment variables
-# (env.allow). There is no network access in v0.1 at all.
+# (env.allow), secrets (secrets), and network egress (network.mode).
+# The default is deny-by-default: no network, no secrets.
 #
 # Policy resolution order: --policy FILE, then ./mantrap.yaml,
 # then ~/.mantrap/mantrap.yaml (or $MANTRAP_DATA_DIR/mantrap.yaml).
@@ -63,6 +73,25 @@ limits:
   # memory: 1073741824      # RLIMIT_AS in bytes
   # cpu_seconds: 60         # RLIMIT_CPU in seconds
   # nproc: 64               # RLIMIT_NPROC
+
+#secrets:
+  # Credential broker: NAME -> source. The VALUE never appears in
+  # this file, the audit log, or error messages. Injected into the
+  # sandbox as an environment variable (--setenv) only.
+  # GH_TOKEN: {env: GH_TOKEN}              # from mantrap's own env
+  # API_KEY: {file: /home/user/.secrets/api_key}  # 0600 file, 1st line
+  # DB_PASS: {keyring: myservice/dbuser}   # needs 'secretstorage'
+
+#network:
+  # Egress control. none (default): --unshare-net, no route out.
+  # host: keep the host network namespace (stderr warning every run).
+  # allowlist: filtered egress via a host-side proxy; see README.
+  # mode: none
+  # allow_domains: [pypi.org, "*.pythonhosted.org"]
+  # allow_plain_http: false
+  # allow_ports: [443]
+  # dns: host
+  # allow_private_ips: false
 """
 
 
@@ -81,7 +110,8 @@ def cmd_init(force: bool) -> int:
     return 0
 
 
-def cmd_run(policy_file: str | None, workload: list[str]) -> int:
+def cmd_run(policy_file: str | None, workload: list[str],
+            dry_run: bool = False) -> int:
     """Run a workload in the sandbox. Returns the exit code."""
     if not workload:
         print(
@@ -92,9 +122,18 @@ def cmd_run(policy_file: str | None, workload: list[str]) -> int:
     try:
         policy_path = resolve_policy_path(policy_file)
         policy, digest = load_policy(policy_path)
+        # Fail-closed: resolve before preflight/bwrap so nothing
+        # starts with a partially-resolved secret set.
+        secrets = resolve_secrets(policy.secrets)
+    except (PolicyError, SandboxError, SecretsError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if dry_run:
+        return _cmd_dry_run(policy_path, policy, workload, secrets)
+    try:
         bwrap = preflight()
         code, killed, duration, fallback = run_workload(
-            bwrap, policy, workload
+            bwrap, policy, workload, secrets=secrets
         )
     except (PolicyError, SandboxError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -102,7 +141,10 @@ def cmd_run(policy_file: str | None, workload: list[str]) -> int:
     try:
         append_run_record(
             policy_sha256=digest,
-            argv=workload,
+            # Scrubbed copy: the workload gets the real argv, but a
+            # secret the user's shell expanded onto the command line
+            # must not reach the audit log.
+            argv=scrub_argv(workload, secrets),
             exit_code=code,
             duration_s=duration,
             killed_by_limit=killed,
@@ -122,6 +164,28 @@ def cmd_run(policy_file: str | None, workload: list[str]) -> int:
             file=sys.stderr,
         )
     return code
+
+
+def _cmd_dry_run(policy_path, policy, workload, secrets) -> int:
+    """Print the resolved policy (masked) and the bwrap command.
+
+    Nothing is executed, no audit record is written, the proxy is
+    not started. Secret values never appear in the output.
+    """
+    print(f"# mantrap dry-run: {policy_path}")
+    print("# secrets (values masked):")
+    print("secrets:")
+    if secrets:
+        for name in sorted(secrets):
+            print(f"  {name}: {mask_value(secrets[name])}")
+    else:
+        print("  {}")
+    preview = build_bwrap_argv(
+        "bwrap", policy, workload, with_proc=True, secrets=secrets
+    )
+    print("# bwrap command (secret values masked):")
+    print(shlex.join(mask_argv(preview, set(secrets))))
+    return 0
 
 
 def _check(label: str, status: str, hint: str = "") -> bool:
@@ -203,6 +267,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="run a command in the sandbox")
     p_run.add_argument("--policy", default=None,
                        help="policy file (default: resolution order)")
+    p_run.add_argument("--dry-run", action="store_true",
+                       help="print the resolved policy (secrets masked) "
+                            "and the bwrap command without running anything")
     p_run.add_argument(
         "workload", nargs=argparse.REMAINDER,
         help="command after --, e.g. mantrap run -- id -u",
@@ -230,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        return cmd_run(args.policy, workload)
+        return cmd_run(args.policy, workload, dry_run=args.dry_run)
     if args.command == "doctor":
         return cmd_doctor()
     parser.print_help()

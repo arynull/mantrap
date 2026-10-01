@@ -55,7 +55,7 @@ directory inside the sandbox.
 Writes a commented `mantrap.yaml` to the current directory.
 Refuses to overwrite an existing file unless `--force` is given.
 
-### `mantrap run [--policy FILE] -- <cmd> [args...]`
+### `mantrap run [--policy FILE] [--dry-run] -- <cmd> [args...]`
 
 Runs the command in the sandbox. Policy resolution order:
 `--policy FILE`, then `./mantrap.yaml`, then
@@ -64,7 +64,9 @@ Runs the command in the sandbox. Policy resolution order:
 Before anything executes, mantrap runs a fail-closed preflight:
 `bwrap` must be on `PATH` and a probe sandbox must start
 successfully. Otherwise it exits 2 with a clear error and nothing
-runs.
+runs. Secret sources are also resolved before anything starts: a
+missing secret fails closed with exit 2 before the sandbox is
+created.
 
 Every run appends one JSON record to `$MANTRAP_DATA_DIR/audit.log`
 (default `~/.mantrap/audit.log`). If the audit log cannot be
@@ -74,6 +76,12 @@ means nothing runs.
 A wall-clock timeout kills the whole process group (SIGTERM, 5s
 grace, then SIGKILL). A limit kill exits with code **124**, which
 is distinct from workload failures.
+
+`--dry-run` loads the policy and resolves secrets, then prints the
+resolved policy with secret values masked (`*** (N chars)`) and the
+full bwrap command with secret values masked — without executing
+anything, starting the proxy, or writing an audit record. A missing
+secret still fails closed (exit 2).
 
 ### `mantrap doctor`
 
@@ -105,6 +113,11 @@ env:
     - PATH
     - HOME
 
+secrets:           # credential broker: NAME -> exactly one source
+  GH_TOKEN: {env: GH_TOKEN}            # from mantrap's own environment
+  API_KEY: {file: /home/user/.secrets/api_key}  # 0600/0400 file, 1st line
+  DB_PASS: {keyring: myservice/dbuser} # needs 'secretstorage' (optional)
+
 limits:
   timeout: 300     # wall-clock seconds; SIGTERM, 5s grace, SIGKILL; exit 124
   # memory: 1073741824   # RLIMIT_AS, bytes (needs prlimit(1))
@@ -123,7 +136,9 @@ network:
 
 Rules: paths must be absolute, must exist, and must not escape via
 `..`. Unknown keys are rejected. A name in `env.allow` that is
-missing from the caller's environment is a fail-closed error.
+missing from the caller's environment is a fail-closed error. A
+secret NAME may not also appear in `env.allow` — one variable, one
+source of truth. Secret names must match `[A-Za-z_][A-Za-z0-9_]*`.
 
 ## How isolation works
 
@@ -213,6 +228,41 @@ Operational notes:
   request appends a `net.allow` / `net.deny` record to the audit
   log (`~/.mantrap/audit.log`, or `$MANTRAP_DATA_DIR/audit.log`).
 
+## Credential broker
+
+Agent workloads need API keys and tokens, but a key baked into a
+policy file or leaked into a log is a breach waiting to happen.
+`secrets:` maps a NAME to where its value comes from — `env:VAR`
+(mantrap's own environment), `file:PATH` (a 0600/0400 file; the
+first line is the value), or `keyring:SERVICE/USER` (the login
+keyring via `secretstorage`; best-effort, optional). The policy
+carries only names and sources, never values.
+
+The broker's guarantees:
+
+- **Injected, not copied.** At run time each value is handed to
+  the sandboxed process as an environment variable
+  (`--setenv`), after the `env.allow` entries so secrets cannot
+  be shadowed. Nothing about the secret touches the host
+  filesystem.
+- **Never in the audit log.** The recorded argv is a scrubbed
+  copy — secret values are replaced with `***` before the
+  record is written. This covers the case where the user's own
+  shell expanded `$TOKEN` onto the workload's command line
+  before mantrap ever saw it.
+- **Never in error messages.** Resolution failures name the
+  secret NAME and the source, never the value.
+- **Fail-closed.** All secrets resolve before preflight runs;
+  a missing variable, an unreadable file, a group-readable
+  file, or an unreachable keyring aborts the run (exit 2)
+  before the sandbox is created.
+- **Inspectable.** `--dry-run` prints the resolved policy with
+  values masked (`*** (N chars)`) and the exact bwrap command
+  with secret values masked, executing nothing.
+
+File sources must be mode 0600 or 0400; anything group- or
+world-readable is refused outright.
+
 ## Limitations
 
 - **Linux only.** Other platforms get a clear error, not a
@@ -220,8 +270,13 @@ Operational notes:
 - **Process isolation, not a VM.** The kernel is shared; kernel
   exploits are out of scope. For hostile-tenant separation, use a
   VM or container runtime with a hardened kernel profile.
-- Secrets handling is limited to `env.allow` passthrough; a
-  proper credential broker is on the roadmap (v0.3).
+- **Secrets are visible in the host process table.** While a
+  run executes, its secret values appear in the bwrap command
+  line, visible via `ps` to the same user. This is the standard
+  environment-variable caveat: the broker guarantees no secret
+  on disk, in the audit log, or in error output — not invisibility
+  from the owning user. The workload's own `/proc/<pid>/environ`
+  lives inside the sandbox's PID namespace.
 
 ## License
 

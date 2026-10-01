@@ -13,6 +13,7 @@ run is refused before anything executes.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,7 +21,7 @@ import yaml
 
 DEFAULT_TIMEOUT_S = 300
 
-KNOWN_TOP_KEYS = {"fs", "env", "limits", "network"}
+KNOWN_TOP_KEYS = {"fs", "env", "limits", "network", "secrets"}
 KNOWN_FS_KEYS = {"read", "write"}
 KNOWN_ENV_KEYS = {"allow"}
 KNOWN_LIMIT_KEYS = {"timeout", "memory", "cpu_seconds", "nproc"}
@@ -34,6 +35,8 @@ KNOWN_NETWORK_KEYS = {
     "dns",
     "allow_private_ips",
 }
+SECRET_SOURCES = ("env", "file", "keyring")
+SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_ALLOW_PORTS = [443]
 
 
@@ -65,6 +68,7 @@ class Policy:
     cpu_seconds: int | None = None
     nproc: int | None = None
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
+    secrets: dict[str, dict[str, str]] = field(default_factory=dict)
     source: str = ""
 
 
@@ -283,6 +287,40 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             "policy key 'network.allow_private_ips' must be a boolean"
         )
 
+    raw_secrets = data.get("secrets", {})
+    if raw_secrets is None:
+        raw_secrets = {}
+    if not isinstance(raw_secrets, dict):
+        raise PolicyError("policy key 'secrets' must be a mapping")
+    secrets: dict[str, dict[str, str]] = {}
+    for name, entry in raw_secrets.items():
+        if not isinstance(name, str) or not SECRET_NAME_RE.match(name):
+            raise PolicyError(
+                f"invalid secret name {name!r}: must match "
+                "[A-Za-z_][A-Za-z0-9_]*"
+            )
+        if (
+            not isinstance(entry, dict)
+            or len(entry) != 1
+            or next(iter(entry)) not in SECRET_SOURCES
+        ):
+            raise PolicyError(
+                f"secret {name!r}: must map exactly one source kind "
+                f"({', '.join(SECRET_SOURCES)}) to a non-empty string"
+            )
+        kind, arg = next(iter(entry.items()))
+        if not isinstance(arg, str) or not arg:
+            raise PolicyError(
+                f"secret {name!r}: source argument must be a non-empty "
+                "string"
+            )
+        if name in allow:
+            raise PolicyError(
+                f"secret {name!r} also appears in 'env.allow': "
+                "a variable has exactly one source of truth"
+            )
+        secrets[name] = {kind: arg}
+
     policy = Policy(
         fs_read=_check_path_list(fs.get("read"), "fs.read"),
         fs_write=_check_path_list(fs.get("write"), "fs.write"),
@@ -299,6 +337,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             dns=dns,
             allow_private_ips=allow_private_ips,
         ),
+        secrets=secrets,
         source=str(path),
     )
     return policy, digest
