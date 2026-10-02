@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check src/
+
+  install-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Clean install from source
+        run: |
+          python -m venv /tmp/ci-venv
+          /tmp/ci-venv/bin/pip install --quiet .
+          /tmp/ci-venv/bin/mantrap --version
+      - name: CLI smoke test (init / dry-run, no bwrap needed)
+        run: |
+          M=/tmp/ci-venv/bin/mantrap
+          mkdir -p /tmp/mt-smoke && cd /tmp/mt-smoke
+          $M init
+          test -f mantrap.yaml
+          # dry-run resolves the policy and prints the bwrap command
+          # without executing anything: exercises the full config path
+          $M run --dry-run -- echo hello | grep -q "dry-run"
+          echo "smoke OK"
