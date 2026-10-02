@@ -31,7 +31,7 @@ install from source as above.
 Verify the install:
 
 ```sh
-mantrap --version   # 1.1.0
+mantrap --version   # 1.2.0
 mantrap doctor      # one line per environment check
 ```
 
@@ -244,6 +244,20 @@ filters to records at or after an ISO-8601 timestamp).
 $ mantrap audit --verify
 audit log verified: 57 records, 1 signatures, chain intact
 ```
+
+**Verify-on-start.** Every `run`/`exec` re-verifies the audit
+chain before anything starts (secrets, snapshot, proxy, bwrap):
+the hash links from the tip back to the most recent signature,
+plus that signature itself — transitively covering the whole
+log. A tampered history refuses the run with exit 2 and names
+the first broken record; nothing is appended, the workload never
+starts. `--dry-run` is exempt (it touches no audit state).
+Alongside the log, mantrap keeps a `audit.tip` sentinel
+(record count + tip hash, 0600): deleting or truncating the log
+while the rest of the state dir survives is caught the same way.
+The honest limit: wiping the entire state dir is
+indistinguishable from a fresh install — the sentinel guards
+partial deletion/truncation, not total erasure.
 
 ### `mantrap snapshot [--policy FILE] [--message MSG]`
 

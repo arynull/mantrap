@@ -17,6 +17,7 @@ from .audit import (
     iter_records,
     utc_now_iso,
     verify_log,
+    verify_tip,
 )
 from .gates import GateDenied, GateError, GateSession
 from .policy import (
@@ -179,6 +180,29 @@ def cmd_run(
     except (PolicyError, SandboxError, SecretsError, GateError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if not dry_run:
+        # Fail-closed audit preflight (v1.2.0): a tampered history
+        # must not be appended to and must not keep running. Runs
+        # after policy load, before secrets resolution, snapshot,
+        # gates, and bwrap. verify_tip checks the chain from the
+        # tip back to the last signature — transitively covering
+        # the whole log — and the tip sentinel against
+        # deletion/truncation. --dry-run touches no audit state,
+        # so it is exempt.
+        try:
+            tip_result = verify_tip()
+        except AuditError as exc:
+            tip_result = None
+            tip_error = str(exc)
+        else:
+            tip_error = tip_result.error
+        if tip_result is None or not tip_result.ok:
+            print(
+                "error: audit log failed verification: "
+                f"{tip_error}; inspect with 'mantrap audit --verify'",
+                file=sys.stderr,
+            )
+            return 2
     if dry_run:
         return _cmd_dry_run(policy_path, policy, workload, secrets)
     if auto_rollback:
@@ -249,7 +273,7 @@ def cmd_run(
             killed_by_limit=killed,
             proc_fallback=fallback,
         )
-    except OSError as exc:
+    except (OSError, AuditError) as exc:
         print(
             f"error: cannot write audit log ({exc}); "
             "refusing to treat the run as complete",

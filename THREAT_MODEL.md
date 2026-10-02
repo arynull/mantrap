@@ -89,6 +89,15 @@ you trust the sandbox.
 - **`strict` may break toolchains.** Debuggers, profilers, and
   some language runtimes legitimately use the strict-only
   syscalls. `default` is the tested balance.
+- **Audit tamper-evidence has a floor.** Verify-on-start
+  (`run`/`exec` refuse on a broken chain) and the `audit.tip`
+  sentinel catch modification, deletion, and truncation of the
+  log — but only while the rest of the state dir survives. A
+  full wipe of `~/.mantrap/` (log + sentinel + keys) is
+  indistinguishable from a fresh install; history that matters
+  should be shipped off-box (e.g. `audit --json` into your
+  log pipeline). v0.1-era records carry no chain links and are
+  grandfathered, not tamper-evident.
 
 ## Non-goals
 
