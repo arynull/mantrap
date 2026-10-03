@@ -44,8 +44,18 @@ contact, so denied domains are never even resolved):
      default.
   7. Forward: CONNECT splices a tunnel after `200 Connection
      established`; plain HTTP is re-emitted origin-form with
-     hop-by-hop headers stripped, then the response is spliced
+     header sanitization (step 7a), then the response is spliced
      back until EOF (60s idle timeout).
+  7a. Header sanitization (always-on, no knob): every `host`
+     header (any casing, all duplicates) and every
+     `proxy-authorization` header is dropped, hop-by-hop headers
+     are stripped, and exactly one pinned
+     `Host: <host>[:<port>]` is prepended — built from the SAME
+     normalized host the allowlist saw in step 2 (IDNA/punycode
+     form; IPv6 literals in brackets; `:port` only when != 80).
+     This closes vhost confusion (`GET http://allowed/...` with
+     `Host: evil` arrives upstream as the allowed host).
+     `CONNECT` is untouched (opaque tunnel, no headers).
 
 Parent-proxy chaining: when the host sets HTTPS_PROXY (or
 lowercase https_proxy), upstream TCP goes to the parent instead:
@@ -150,6 +160,16 @@ HOP_BY_HOP = frozenset(
         "upgrade",
     }
 )
+
+
+def build_pinned_host(host: str, port: int) -> str:
+    """Format the pinned Host value: IDNA host, brackets for IPv6, :port unless 80."""
+    normalized = normalize_host(strip_brackets(host))
+    if ":" in normalized:
+        normalized = f"[{normalized}]"
+    if port != 80:
+        normalized = f"{normalized}:{port}"
+    return normalized
 
 
 class _HttpError(Exception):
@@ -617,6 +637,30 @@ class FilteringProxy:
                 return "private_ip"
         return None
 
+    @staticmethod
+    def sanitize_headers(
+        headers: list[tuple[str, str]], host: str, port: int
+    ) -> list[tuple[str, str]]:
+        """Pin the Host header to the allowlisted target; strip proxy creds.
+
+        Drops every `host` header (any casing, all duplicates) and
+        every `proxy-authorization` header, applies the existing
+        HOP_BY_HOP filtering, then prepends exactly one
+        `Host: <host>[:<port>]` built from the request-line target
+        (IDNA form; IPv6 in brackets; `:port` only when != 80).
+        Honest clients (Host == request host) see no change beyond
+        normalization.
+        """
+        pinned = build_pinned_host(host, port)
+        kept = [
+            (name, value)
+            for name, value in headers
+            if name.lower() != "host"
+            and name.lower() != "proxy-authorization"
+            and name.lower() not in HOP_BY_HOP
+        ]
+        return [("Host", pinned), *kept]
+
     def connect_upstream(
         self, ips: list[str], port: int
     ) -> socket.socket | None:
@@ -806,9 +850,8 @@ class FilteringProxy:
             self.send_error(conn, 502, "upstream connect failed")
             return
         lines = [f"{method} {origin} HTTP/1.1"]
-        for name, value in headers:
-            if name.lower() not in HOP_BY_HOP:
-                lines.append(f"{name}: {value}")
+        for name, value in self.sanitize_headers(headers, domain, port):
+            lines.append(f"{name}: {value}")
         lines.append("Connection: close")
         try:
             upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode(
@@ -842,9 +885,8 @@ class FilteringProxy:
             self.send_error(conn, 502, "parent proxy unreachable")
             return
         lines = [f"{method} {target} HTTP/1.1"]
-        for name, value in headers:
-            if name.lower() not in HOP_BY_HOP:
-                lines.append(f"{name}: {value}")
+        for name, value in self.sanitize_headers(headers, domain, port):
+            lines.append(f"{name}: {value}")
         lines.append("Connection: close")
         try:
             upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode(

@@ -31,7 +31,7 @@ install from source as above.
 Verify the install:
 
 ```sh
-mantrap --version   # 1.2.0
+mantrap --version   # 1.3.0
 mantrap doctor      # one line per environment check
 ```
 
@@ -439,6 +439,12 @@ Why this is unbypassable without privileges:
   loopback/private/link-local upstream IPs are refused unless
   `allow_private_ips: true` (this blocks SSRF to
   `169.254.169.254` and host-local services by default).
+- Host pinning (always on): plain-HTTP requests are re-emitted
+  with exactly one `Host` header built from the allowlisted
+  request-line target (IDNA form; `:port` only when not 80), so
+  a forged `Host: evil` never reaches the upstream (vhost
+  confusion closed). `Proxy-Authorization` is stripped and
+  never forwarded; `CONNECT` tunnels stay opaque by design.
 
 Fail-closed in every direction: if the relay can't bind or can't
 reach P1, the workload never starts; if the workload kills the
