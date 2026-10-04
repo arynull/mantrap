@@ -98,6 +98,15 @@ you trust the sandbox.
   should be shipped off-box (e.g. `audit --json` into your
   log pipeline). v0.1-era records carry no chain links and are
   grandfathered, not tamper-evident.
+- **Gate path-alias bypass (closed in v1.4.0).** Previously an
+  `exec.path` / `fs.write` rule written against the canonical path
+  could be dodged by a non-canonical spelling of the same file
+  (`/bin/curl` vs `/usr/bin/curl` on merged-/usr, a symlinked
+  alias, or `sub/../bin/curl` for exec; `/host/../etc` or a
+  symlinked mount for fs.write). Rule patterns and candidate values
+  are now canonicalized (symlinks resolved) on both sides, so alias
+  spellings match the same rule; canonicalization can only add
+  matches, preserving the fail-closed direction.
 
 ## Non-goals
 

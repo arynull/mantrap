@@ -12,6 +12,12 @@ path) and decides it before anything runs:
 Rules evaluate in policy order; the first match wins (firewall order,
 so put specific allows before broad asks).
 
+Path-kind patterns (``exec.path``, ``fs.write``) are canonicalized
+with ``os.path.realpath`` at parse time and candidate values at
+decision time, so symlink aliases and ``..`` spellings match the same
+rule; this can only add matches, never remove them (fail-closed
+direction preserved).
+
 Gate decisions never carry secret values: details name binaries,
 domains, and mount paths only.
 """
@@ -105,6 +111,9 @@ def parse_gates(raw: object) -> list[GateRule]:
                 f"{where}: action must be one of {', '.join(ACTIONS)} "
                 f"(got {action!r})"
             )
+        if kind in ("exec.path", "fs.write"):
+            # resolve symlink spellings: a rule must match every alias of the same file
+            pattern = os.path.realpath(pattern)
         description = entry.get("description")
         if description is None:
             description = f"{kind} matches {pattern!r}"
@@ -191,11 +200,15 @@ class GateSession:
         **First match wins** (firewall order — put specific allows
         before broad asks). Matching per kind:
 
-        - ``exec.path``: ``fnmatch.fnmatchcase(value, pattern)``.
+        - ``exec.path``: ``fnmatch.fnmatchcase(value, pattern)``;
+          candidate spellings canonicalized via ``exec_candidates``,
+          pattern canonicalized at parse time.
         - ``net.domain``: case-insensitive glob (pattern is stored
           lowercased, value is lowered before matching).
-        - ``fs.write``: exact path or strict child (``/etc`` matches
-          ``/etc`` and ``/etc/passwd`` but not ``/etcetera``).
+        - ``fs.write``: value canonicalized with ``os.path.realpath``
+          before the prefix compare; exact path or strict child
+          (``/etc`` matches ``/etc`` and ``/etc/passwd`` but not
+          ``/etcetera``).
         """
         for rule in self.rules:
             if rule.match_kind != kind:
@@ -207,6 +220,8 @@ class GateSession:
                 if fnmatch.fnmatchcase(value.lower(), rule.pattern):
                     return rule
             elif kind == "fs.write":
+                # resolve alias spellings to the canonical path before comparing
+                value = os.path.realpath(value)
                 prefix = rule.pattern.rstrip("/") + "/"
                 if value == rule.pattern or value.startswith(prefix):
                     return rule
@@ -216,15 +231,18 @@ class GateSession:
     def exec_candidates(argv0: str) -> list[str]:
         """Candidate path spellings an `exec.path` glob may match.
 
-        ``[argv0]`` plus the ``PATH`` resolution when argv0 names a
-        bare command, so a ``curl`` invocation matches a
-        ``/usr/bin/curl`` glob.
+        Raw spelling first plus canonical spellings, so symlink
+        aliases and ``..`` spellings match the same rule. Includes
+        the ``PATH`` resolution when argv0 names a bare command, so
+        a ``curl`` invocation matches a ``/usr/bin/curl`` glob.
         """
         if "/" in argv0:
-            return [argv0]
+            return list(dict.fromkeys([argv0, os.path.realpath(argv0)]))
         resolved = shutil.which(argv0)
         if resolved:
-            return [argv0, resolved]
+            return list(
+                dict.fromkeys([argv0, resolved, os.path.realpath(resolved)])
+            )
         return [argv0]
 
     def check_exec_path(self, argv0: str) -> Literal["allow"]:

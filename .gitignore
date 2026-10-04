@@ -23,3 +23,5 @@ build/
 .venv/
 .pytest_cache/
 .ruff_cache/
+
+RESEARCH.md

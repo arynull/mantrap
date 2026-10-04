@@ -508,6 +508,12 @@ three match kinds:
   mount list — including `exec --add-write` — before the
   sandbox starts.
 
+`exec.path` and `fs.write` patterns are canonicalized (symlinks
+resolved) on both the rule and the value side: a rule written as
+`/usr/bin/curl` also matches `/bin/curl` on merged-`/usr`
+systems, and `/host/../etc` cannot dodge an `fs.write: /etc`
+rule. Canonicalization can only add matches, never remove them.
+
 Actions: `allow` proceeds (audited), `deny` refuses fail-closed
 with exit 2 (audited), `ask` pauses the workload and prompts on
 the controlling terminal:
