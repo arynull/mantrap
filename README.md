@@ -259,6 +259,12 @@ The honest limit: wiping the entire state dir is
 indistinguishable from a fresh install — the sentinel guards
 partial deletion/truncation, not total erasure.
 
+The log is size-capped (`limits.audit_max_mb`, default 512 MB);
+when the cap would be crossed the run exits 2 with a remedy
+message — archive with `mantrap audit --json`, then rotate or
+truncate `~/.mantrap/audit.log`. The proxy denies new connections
+instead of proxying them unaudited.
+
 ### `mantrap snapshot [--policy FILE] [--message MSG]`
 
 Snapshots the policy's first writable mount (host-side, via
@@ -314,6 +320,8 @@ limits:
   # cpu_seconds: 60      # RLIMIT_CPU, seconds (needs prlimit(1))
   # nproc: 64            # RLIMIT_NPROC (needs prlimit(1))
   seccomp: default  # off | default | strict — syscall denylist (see below)
+  audit_max_mb: 512  # audit log size cap in MB; run/exec refuse to start
+                     # when full (fail-closed); 0 disables the cap
 
 network:
   mode: none           # none | host | allowlist

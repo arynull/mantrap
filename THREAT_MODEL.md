@@ -77,8 +77,11 @@ you trust the sandbox.
   is a data-exfiltration channel by definition. Allowlists are
   trust decisions, not walls.
 - **Resource exhaustion.** `limits.memory/cpu_seconds/nproc`
-  bound the workload, but the audit log and snapshots grow on
-  the host; monitor disk.
+  bound the workload, and the audit log is now size-capped
+  (`limits.audit_max_mb`, default 512 MB, fail-closed: a full log
+  refuses new runs and the proxy denies new connections rather
+  than proxying them unaudited). Snapshots still grow on the host;
+  monitor disk.
 - **The metadata blocklist is advisory for exotic clouds.** The
   well-known endpoints (AWS/GCP/Azure/Alibaba IPv4+IPv6 literals
   and GCP hostnames) are blocked; a cloud with an undocumented

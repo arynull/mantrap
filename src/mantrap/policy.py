@@ -26,7 +26,10 @@ DEFAULT_TIMEOUT_S = 300
 KNOWN_TOP_KEYS = {"fs", "env", "limits", "network", "secrets", "gates"}
 KNOWN_FS_KEYS = {"read", "write"}
 KNOWN_ENV_KEYS = {"allow"}
-KNOWN_LIMIT_KEYS = {"timeout", "memory", "cpu_seconds", "nproc", "seccomp"}
+KNOWN_LIMIT_KEYS = {
+    "timeout", "memory", "cpu_seconds", "nproc", "seccomp",
+    "audit_max_mb",
+}
 SECCOMP_LEVELS = ("off", "default", "strict")
 NETWORK_MODES = {"none", "host", "allowlist"}
 NETWORK_DNS = {"host", "off"}
@@ -77,6 +80,7 @@ class Policy:
     cpu_seconds: int | None = None
     nproc: int | None = None
     seccomp: str = "default"
+    audit_max_mb: int | float = 512
     network: NetworkPolicy = field(default_factory=NetworkPolicy)
     secrets: dict[str, dict[str, str]] = field(default_factory=dict)
     gates: list[GateRule] = field(default_factory=list)
@@ -247,6 +251,22 @@ def load_policy(path: Path) -> tuple[Policy, str]:
             f"{list(SECCOMP_LEVELS)} (got {seccomp!r})"
         )
 
+    audit_max_mb = limits.get("audit_max_mb", 512)
+    if audit_max_mb is None:
+        audit_max_mb = 512
+    if isinstance(audit_max_mb, bool) or not isinstance(
+        audit_max_mb, (int, float)
+    ):
+        raise PolicyError(
+            "policy key 'limits.audit_max_mb' must be a number "
+            "(0 disables the cap)"
+        )
+    if audit_max_mb < 0:
+        raise PolicyError(
+            "policy key 'limits.audit_max_mb' must be non-negative "
+            "(0 disables the cap)"
+        )
+
     network = data.get("network", {})
 
     def _opt_int(key: str) -> int | None:
@@ -381,6 +401,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
         cpu_seconds=_opt_int("cpu_seconds"),
         nproc=_opt_int("nproc"),
         seccomp=seccomp,
+        audit_max_mb=audit_max_mb,
         network=NetworkPolicy(
             mode=mode,
             allow_domains=list(allow_domains),

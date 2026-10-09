@@ -12,9 +12,12 @@ from pathlib import Path
 from . import __version__, keys, snapshots
 from .audit import (
     AuditError,
+    AuditFullError,
     append_record,
     append_run_record,
+    check_capacity,
     iter_records,
+    set_size_cap_bytes,
     utc_now_iso,
     verify_log,
     verify_tip,
@@ -168,6 +171,13 @@ def cmd_run(
     try:
         policy_path = resolve_policy_path(policy_file)
         policy, digest = load_policy(policy_path)
+        # Audit size cap (v1.5.0): policy value is MB, the audit
+        # module takes bytes; 0 disables (explicit opt-out).
+        set_size_cap_bytes(
+            None
+            if policy.audit_max_mb == 0
+            else int(policy.audit_max_mb * 1024 * 1024)
+        )
         # Fail-closed: resolve before preflight/bwrap so nothing
         # starts with a partially-resolved secret set.
         secrets = resolve_secrets(policy.secrets)
@@ -202,6 +212,13 @@ def cmd_run(
                 f"{tip_error}; inspect with 'mantrap audit --verify'",
                 file=sys.stderr,
             )
+            return 2
+        # Fail-closed capacity preflight (v1.5.0): an already-full log
+        # means this run cannot be audited, so it must not start.
+        try:
+            check_capacity()
+        except AuditFullError as exc:
+            print(f"error: {exc}", file=sys.stderr)
             return 2
     if dry_run:
         return _cmd_dry_run(policy_path, policy, workload, secrets)
@@ -255,6 +272,15 @@ def cmd_run(
     except GateDenied as exc:
         print(
             f"error: denied by {exc.rule_id}: {exc.detail}",
+            file=sys.stderr,
+        )
+        return 2
+    except AuditError as exc:
+        # Mid-run exhaustion is fail-closed, not silent: a run that
+        # cannot be audited does not continue.
+        print(
+            f"error: audit write failed ({exc}); refusing to treat "
+            "the run as audited",
             file=sys.stderr,
         )
         return 2
@@ -341,6 +367,11 @@ def _cmd_dry_run(policy_path, policy, workload, secrets) -> int:
     )
     print("# bwrap command (secret values masked):")
     print(shlex.join(mask_argv(preview, set(secrets))))
+    print("limits:")
+    if policy.audit_max_mb == 0:
+        print("  audit_max_mb: 0 (audit log uncapped)")
+    else:
+        print(f"  audit_max_mb: {policy.audit_max_mb}")
     print("gates:")
     if policy.gates:
         for rule in policy.gates:

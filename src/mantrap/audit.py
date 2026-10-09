@@ -55,6 +55,64 @@ class AuditError(Exception):
     """The audit log is unreadable or failed verification."""
 
 
+class AuditFullError(AuditError):
+    """The audit log size cap would be crossed by this write."""
+
+
+DEFAULT_AUDIT_MAX_MB = 512
+
+# Fail-closed audit size cap in bytes; None disables it (explicit
+# opt-out). The policy layer converts `limits.audit_max_mb` into this.
+_size_cap_bytes: int | None = DEFAULT_AUDIT_MAX_MB * 1024 * 1024
+
+
+def set_size_cap_bytes(n: int | None) -> None:
+    """Configure the audit size cap in bytes.
+
+    None or 0 disables the cap (explicit opt-out). Anything else must
+    be a non-negative int; bool/negative/non-int raises AuditError,
+    because silently unbounded is never acceptable here.
+    """
+    global _size_cap_bytes
+    if n is None or n == 0:
+        _size_cap_bytes = None
+        return
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise AuditError(
+            f"audit size cap must be a non-negative int of bytes, "
+            f"got {n!r}"
+        )
+    _size_cap_bytes = n
+
+
+def _log_size_bytes(target_dir: Path) -> int:
+    target = target_dir / AUDIT_FILENAME
+    if not target.exists():
+        return 0
+    return target.stat().st_size
+
+
+def check_capacity(
+    extra_bytes: int = 0, directory: Path | None = None
+) -> None:
+    """Fail-closed capacity preflight: the next write fits in the cap.
+
+    Raises AuditFullError (naming the remedy) when
+    current_size + extra_bytes would exceed the cap. A missing log
+    counts as size 0 — a fresh install never fails.
+    """
+    if _size_cap_bytes is None:
+        return
+    target_dir = directory if directory is not None else data_dir()
+    current = _log_size_bytes(target_dir)
+    if current + extra_bytes > _size_cap_bytes:
+        raise AuditFullError(
+            f"audit log is full ({current} bytes, cap "
+            f"{_size_cap_bytes} bytes): refusing to write; archive "
+            f"with `mantrap audit --json`, then rotate/truncate the log"
+        )
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -205,7 +263,11 @@ def append_record(record: dict, directory: Path | None = None) -> dict:
         chained["prev_hash"] = record_hash(json.loads(lines[-1]))
     else:
         chained["prev_hash"] = GENESIS_HASH
-    lines.append(json.dumps(chained) + "\n")
+    line = json.dumps(chained) + "\n"
+    lines.append(line)
+    # Fail-closed size cap: the record that would cross the cap raises
+    # before anything is written, so the log stays valid.
+    check_capacity(len(line.encode("utf-8")), directory=target_dir)
     _atomic_write_lines(target, lines)
     record_count = len(lines)
     tip = record_hash(chained)

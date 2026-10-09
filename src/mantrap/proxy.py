@@ -94,6 +94,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -101,7 +102,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .audit import append_record, utc_now_iso
+from .audit import AuditFullError, append_record, utc_now_iso
 
 HEADER_LIMIT = 64 * 1024
 READ_TIMEOUT_S = 10.0
@@ -550,6 +551,7 @@ class FilteringProxy:
         )
         self.allow_private_ips = net_config.allow_private_ips
         self.audit_append = audit_append or append_record
+        self.audit_exhausted = False
         self.gate_check = gate_check
         # Indirection for testability: no real DNS in the tests.
         self.resolver_fn = resolver_fn or system_resolve
@@ -557,6 +559,10 @@ class FilteringProxy:
 
     def audit(self, *, type: str, domain: str, port: int,
               scheme: str, decision: str, reason: str) -> None:
+        if self.audit_exhausted:
+            # The cap is fatal for new connections: skip further
+            # appends (no per-connection stderr spam).
+            return
         try:
             self.audit_append(
                 {
@@ -569,6 +575,16 @@ class FilteringProxy:
                     "decision": decision,
                     "reason": reason,
                 }
+            )
+        except AuditFullError as exc:
+            # One loud warning; from here every handler denies
+            # instead of proxying anything unaudited.
+            self.audit_exhausted = True
+            print(
+                f"proxy: AUDIT LOG FULL ({exc}) — denying all "
+                "further connections instead of proxying them "
+                "unaudited",
+                file=sys.stderr,
             )
         except Exception as exc:  # noqa: BLE001 - never crash on audit
             print(f"proxy: audit append failed: {exc}")
@@ -710,6 +726,10 @@ class FilteringProxy:
     def handle_connect(
         self, conn: socket.socket, host: str, port: int
     ) -> None:
+        if self.audit_exhausted:
+            self.deny(conn, domain=strip_brackets(host), port=port,
+                      scheme="connect", reason="audit_log_full")
+            return
         if is_metadata_endpoint(host):
             self.deny(conn, domain=strip_brackets(host), port=port,
                       scheme="connect", reason="metadata_blocklisted")
@@ -810,6 +830,10 @@ class FilteringProxy:
                      headers: list[tuple[str, str]]) -> None:
         host, port, origin = parse_absolute_uri(target)
         domain = strip_brackets(host)
+        if self.audit_exhausted:
+            self.deny(conn, domain=domain, port=port,
+                      scheme="http", reason="audit_log_full")
+            return
         if is_metadata_endpoint(host):
             self.deny(conn, domain=domain, port=port,
                       scheme="http", reason="metadata_blocklisted")
@@ -874,6 +898,10 @@ class FilteringProxy:
                     method: str, target: str,
                     headers: list[tuple[str, str]],
                     domain: str, port: int) -> None:
+        if self.audit_exhausted:
+            self.deny(conn, domain=domain, port=port,
+                      scheme="http", reason="audit_log_full")
+            return
         try:
             upstream = socket.create_connection(
                 parent, timeout=CONNECT_TIMEOUT_S
