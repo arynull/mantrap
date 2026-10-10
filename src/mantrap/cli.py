@@ -593,47 +593,74 @@ def cmd_rollback(snap_id: str, *, dry_run: bool = False) -> int:
     return 0
 
 
-def _check(label: str, status: str, hint: str = "") -> bool:
-    """Print one doctor line; returns True when it is not FAIL."""
-    line = f"{status:4}  {label}"
-    if hint:
-        line += f" — {hint}"
-    print(line)
-    return status != "FAIL"
+def _check(
+    label: str,
+    status: str,
+    hint: str = "",
+    *,
+    checks: list[dict[str, object]] | None = None,
+    emit: bool = True,
+) -> bool:
+    """Record and optionally print one doctor line; True when not FAIL."""
+    ok = status != "FAIL"
+    if checks is not None:
+        checks.append({"name": label, "ok": ok, "detail": hint})
+    if emit:
+        line = f"{status:4}  {label}"
+        if hint:
+            line += f" — {hint}"
+        print(line)
+    return ok
 
 
-def cmd_doctor() -> int:
+def cmd_doctor(as_json: bool = False) -> int:
     """Run environment checks. Exit 0 iff no FAIL."""
     ok = True
+    checks: list[dict[str, object]] = []
+    emit = not as_json
 
     bwrap = None
     try:
         bwrap = find_bwrap()
-        ok &= _check("bwrap on PATH", "PASS", f"found {bwrap}")
+        ok &= _check(
+            "bwrap on PATH", "PASS", f"found {bwrap}",
+            checks=checks, emit=emit,
+        )
     except SandboxError:
         ok &= _check(
             "bwrap on PATH", "FAIL", "install bubblewrap "
-            "(e.g. `apt install bubblewrap`)"
+            "(e.g. `apt install bubblewrap`)",
+            checks=checks, emit=emit,
         )
 
     if bwrap is not None and probe_userns(bwrap, with_proc=False):
-        ok &= _check("user namespaces usable", "PASS", "bwrap probe ran")
+        ok &= _check(
+            "user namespaces usable", "PASS", "bwrap probe ran",
+            checks=checks, emit=emit,
+        )
     else:
         ok &= _check(
             "user namespaces usable",
             "FAIL",
             "enable unprivileged user namespaces "
             "(e.g. `sysctl kernel.unprivileged_userns_clone=1`)",
+            checks=checks,
+            emit=emit,
         )
 
     if bwrap is not None and proc_available(bwrap):
-        ok &= _check("private /proc mountable", "PASS", "")
+        ok &= _check(
+            "private /proc mountable", "PASS", "",
+            checks=checks, emit=emit,
+        )
     else:
         ok &= _check(
             "private /proc mountable",
             "WARN",
             "no-proc fallback will run workloads without /proc "
             "(isolation unaffected)",
+            checks=checks,
+            emit=emit,
         )
 
     directory = data_dir()
@@ -642,14 +669,21 @@ def cmd_doctor() -> int:
         probe = directory / ".writetest"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
-        ok &= _check("audit dir writable", "PASS", f"{directory}")
+        ok &= _check(
+            "audit dir writable", "PASS", f"{directory}",
+            checks=checks, emit=emit,
+        )
     except OSError as exc:
         ok &= _check(
             "audit dir writable",
             "FAIL",
             f"cannot write {directory}: {exc}",
+            checks=checks,
+            emit=emit,
         )
 
+    if as_json:
+        print(json.dumps({"checks": checks, "healthy": ok}))
     return 0 if ok else 1
 
 
@@ -720,7 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
              "--add-write /home/user/out -- make build",
     )
 
-    sub.add_parser("doctor", help="check the sandbox environment")
+    p_doctor = sub.add_parser("doctor", help="check the sandbox environment")
+    p_doctor.add_argument(
+        "--json", action="store_true",
+        help="print checks as JSON",
+    )
 
     p_keygen = sub.add_parser(
         "keygen", help="create the audit-log signing key")
@@ -800,7 +838,7 @@ def main(argv: list[str] | None = None) -> int:
             auto_rollback=args.auto_rollback,
         )
     if args.command == "doctor":
-        return cmd_doctor()
+        return cmd_doctor(as_json=args.json)
     if args.command == "keygen":
         return cmd_keygen(rotate=args.rotate)
     if args.command == "audit":
