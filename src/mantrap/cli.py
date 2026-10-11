@@ -459,10 +459,25 @@ def _parse_since(raw: str) -> datetime:
     return parsed
 
 
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--limit must be a positive integer, got {raw!r}"
+        ) from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"--limit must be a positive integer, got {raw!r}"
+        )
+    return value
+
+
 def cmd_audit(
     *,
     verify: bool = False,
     since: str | None = None,
+    limit: int | None = None,
     as_json: bool = False,
 ) -> int:
     """Show the audit log; --verify re-checks chain + signatures."""
@@ -490,6 +505,8 @@ def cmd_audit(
         records = [
             (n, r) for n, r in records if datetime.fromisoformat(r["ts"]) >= cutoff
         ]
+    if limit is not None:
+        records = records[:limit]
     if as_json:
         for _n, record in records:
             print(json.dumps(record, sort_keys=True))
@@ -807,6 +824,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="only show records at or after this ISO-8601 timestamp",
     )
     p_audit.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="show at most N records (positive integer; default: all)",
+    )
+    p_audit.add_argument(
         "--json",
         action="store_true",
         help="print records as JSON (one per line)",
@@ -877,7 +901,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "keygen":
         return cmd_keygen(rotate=args.rotate)
     if args.command == "audit":
-        return cmd_audit(verify=args.verify, since=args.since, as_json=args.json)
+        return cmd_audit(
+            verify=args.verify, since=args.since, limit=args.limit, as_json=args.json
+        )
     if args.command == "snapshot":
         return cmd_snapshot(args.policy, message=args.message)
     if args.command == "snapshots":
