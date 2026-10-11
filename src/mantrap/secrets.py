@@ -37,15 +37,13 @@ def _resolve_env(name: str, var: str) -> str:
 def _resolve_file(name: str, path: str) -> str:
     if not os.path.isfile(path):
         raise SecretsError(
-            f"secret {name!r}: file {path!r} does not exist "
-            "or is not a regular file"
+            f"secret {name!r}: file {path!r} does not exist or is not a regular file"
         )
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)
     except OSError as exc:
         raise SecretsError(
-            f"secret {name!r}: cannot stat file {path!r}: "
-            f"{type(exc).__name__}"
+            f"secret {name!r}: cannot stat file {path!r}: {type(exc).__name__}"
         ) from None
     if mode & 0o077:
         raise SecretsError(
@@ -57,8 +55,7 @@ def _resolve_file(name: str, path: str) -> str:
             lines = handle.read().splitlines()
     except (OSError, UnicodeDecodeError) as exc:
         raise SecretsError(
-            f"secret {name!r}: cannot read file {path!r}: "
-            f"{type(exc).__name__}"
+            f"secret {name!r}: cannot read file {path!r}: {type(exc).__name__}"
         ) from None
     if not lines:
         raise SecretsError(f"secret {name!r}: file {path!r} is empty")
@@ -76,14 +73,12 @@ def _resolve_keyring(name: str, spec: str) -> str:
     service, _, user = spec.partition("/")
     if not service or not user:
         raise SecretsError(
-            f"secret {name!r}: keyring source must be SERVICE/USER "
-            f"(got {spec!r})"
+            f"secret {name!r}: keyring source must be SERVICE/USER (got {spec!r})"
         )
     try:
         connection = secretstorage.dbus_init()
         collection = secretstorage.get_default_collection(connection)
-        items = list(collection.search_items(
-            {"service": service, "username": user}))
+        items = list(collection.search_items({"service": service, "username": user}))
         if not items:
             raise LookupError("not found")
         item = items[0]
@@ -117,8 +112,7 @@ def resolve_secrets(spec: dict[str, dict]) -> dict[str, str]:
         entry = spec[name]
         if not isinstance(entry, dict) or len(entry) != 1:
             raise SecretsError(
-                f"secret {name!r}: must map exactly one source kind "
-                "to its argument"
+                f"secret {name!r}: must map exactly one source kind to its argument"
             )
         kind, arg = next(iter(entry.items()))
         if kind not in SECRET_SOURCES:
@@ -143,9 +137,7 @@ def scrub_argv(argv: list[str], secrets: dict[str, str]) -> list[str]:
     The workload still receives the real argv; only the recorded
     copy is scrubbed.
     """
-    values = sorted(
-        {v for v in secrets.values() if v}, key=len, reverse=True
-    )
+    values = sorted({v for v in secrets.values() if v}, key=len, reverse=True)
     if not values:
         return list(argv)
     scrubbed = []

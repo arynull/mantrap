@@ -12,7 +12,7 @@ import os
 import resource
 import shutil
 import signal
-import subprocess
+import subprocess  # nosec B404  # launches bwrap with argv lists, no shell
 import sys
 import time
 from pathlib import Path
@@ -36,8 +36,7 @@ NO_PROC_WARNING = (
 )
 
 HOST_NET_WARNING = (
-    "warning: network.mode=host — the sandbox shares the host "
-    "network stack"
+    "warning: network.mode=host — the sandbox shares the host network stack"
 )
 
 EMPTY_ALLOWLIST_WARNING = (
@@ -94,7 +93,7 @@ def probe_userns(bwrap: str, with_proc: bool = False) -> bool:
         cmd += ["--proc", "/proc"]
     cmd += ["/usr/bin/true"]
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603  # argv list, no shell
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     except OSError:
@@ -147,7 +146,7 @@ def build_bwrap_argv(
     # Tmpfs mounts go before user write-binds: a later --tmpfs /tmp
     # would otherwise hide any write mount under /tmp, and --bind
     # needs its destination to exist (created with --dir below).
-    cmd += ["--tmpfs", "/tmp"]
+    cmd += ["--tmpfs", "/tmp"]  # nosec B108  # sandbox mount point, not a temp file
     cmd += ["--tmpfs", "/dev"]
     for node in DEV_BINDS:
         if os.path.exists(node):
@@ -210,13 +209,12 @@ def build_bwrap_argv(
     for name in sorted(resolved):
         cmd += ["--setenv", name, resolved[name]]
     if mode == "allowlist":
-        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
-                    "https_proxy"):
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             cmd += ["--setenv", var, RELAY_URL]
     if policy.fs_write:
         cmd += ["--chdir", policy.fs_write[0]]
     else:
-        cmd += ["--chdir", "/tmp"]
+        cmd += ["--chdir", "/tmp"]  # nosec B108  # sandbox chdir target, not a temp file
     if mode == "allowlist":
         wrapped = [
             "python3",
@@ -294,7 +292,7 @@ def spawn(
     fail-closed.
     """
     start = time.monotonic()
-    proc = subprocess.Popen(
+    proc = subprocess.Popen(  # nosec B603  # argv list, no shell
         argv,
         start_new_session=True,
         preexec_fn=_no_core_dumps,
@@ -395,15 +393,11 @@ def run_workload(
                 data_dir(),
                 audit_append=append_record,
                 gate_check=(
-                    gate_session.check_net_domain
-                    if gate_session is not None
-                    else None
+                    gate_session.check_net_domain if gate_session is not None else None
                 ),
             )
         except OSError as exc:
-            raise SandboxError(
-                f"cannot start filtering proxy: {exc}"
-            ) from exc
+            raise SandboxError(f"cannot start filtering proxy: {exc}") from exc
     try:
         prefix = prlimit_prefix(policy)
 
@@ -412,9 +406,7 @@ def run_workload(
         # in the finally below. Unknown arch fails closed.
         if policy.seccomp != "off":
             try:
-                filt = _seccomp.write_filter_file(
-                    policy.seccomp, data_dir()
-                )
+                filt = _seccomp.write_filter_file(policy.seccomp, data_dir())
             except _seccomp.SeccompError as exc:
                 raise SandboxError(str(exc)) from exc
             seccomp_fd = os.open(filt, os.O_RDONLY)

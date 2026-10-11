@@ -132,8 +132,7 @@ def cmd_init(force: bool) -> int:
     target = Path.cwd() / "mantrap.yaml"
     if target.exists() and not force:
         print(
-            f"error: {target} already exists; "
-            "pass --force to overwrite it",
+            f"error: {target} already exists; pass --force to overwrite it",
             file=sys.stderr,
         )
         return 1
@@ -174,9 +173,7 @@ def cmd_run(
         # Audit size cap (v1.5.0): policy value is MB, the audit
         # module takes bytes; 0 disables (explicit opt-out).
         set_size_cap_bytes(
-            None
-            if policy.audit_max_mb == 0
-            else int(policy.audit_max_mb * 1024 * 1024)
+            None if policy.audit_max_mb == 0 else int(policy.audit_max_mb * 1024 * 1024)
         )
         # Fail-closed: resolve before preflight/bwrap so nothing
         # starts with a partially-resolved secret set.
@@ -184,9 +181,7 @@ def cmd_run(
         for raw in add_writes or []:
             # Same validation as fs.write; appended for this run
             # only, never written back to the policy file.
-            policy.fs_write.append(
-                validate_write_path(raw, "fs.write (--add-write)")
-            )
+            policy.fs_write.append(validate_write_path(raw, "fs.write (--add-write)"))
     except (PolicyError, SandboxError, SecretsError, GateError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -205,7 +200,10 @@ def cmd_run(
             tip_result = None
             tip_error = str(exc)
         else:
-            tip_error = tip_result.error
+            if tip_result is None:
+                tip_error = ""
+            else:
+                tip_error = tip_result.error or ""
         if tip_result is None or not tip_result.ok:
             print(
                 "error: audit log failed verification: "
@@ -266,7 +264,10 @@ def cmd_run(
     try:
         bwrap = preflight()
         code, killed, duration, fallback = run_workload(
-            bwrap, policy, workload, secrets=secrets,
+            bwrap,
+            policy,
+            workload,
+            secrets=secrets,
             gate_session=gate_session,
         )
     except GateDenied as exc:
@@ -279,8 +280,7 @@ def cmd_run(
         # Mid-run exhaustion is fail-closed, not silent: a run that
         # cannot be audited does not continue.
         print(
-            f"error: audit write failed ({exc}); refusing to treat "
-            "the run as audited",
+            f"error: audit write failed ({exc}); refusing to treat the run as audited",
             file=sys.stderr,
         )
         return 2
@@ -308,8 +308,7 @@ def cmd_run(
         return 2
     if killed:
         print(
-            f"mantrap: workload killed after {policy.timeout}s limit "
-            "(exit 124)",
+            f"mantrap: workload killed after {policy.timeout}s limit (exit 124)",
             file=sys.stderr,
         )
     if snap_meta is not None and (killed or code != 0):
@@ -375,10 +374,7 @@ def _cmd_dry_run(policy_path, policy, workload, secrets) -> int:
     print("gates:")
     if policy.gates:
         for rule in policy.gates:
-            print(
-                f"  {rule.id}: {rule.match_kind} {rule.pattern}"
-                f" -> {rule.action}"
-            )
+            print(f"  {rule.id}: {rule.match_kind} {rule.pattern} -> {rule.action}")
     else:
         print("  {}")
     return 0
@@ -441,12 +437,12 @@ def _format_record(record: dict) -> str:
         detail = f"{record.get('snap_id', '')} {record.get('message', '')}".strip()
     elif rtype == "snapshot.rollback":
         detail = (
-            f"{record.get('snap_id', '')} "
-            f"restored={record.get('restored_files', '?')}"
+            f"{record.get('snap_id', '')} restored={record.get('restored_files', '?')}"
         )
     else:
-        rest = {k: v for k, v in record.items()
-                if k not in ("v", "ts", "type", "prev_hash")}
+        rest = {
+            k: v for k, v in record.items() if k not in ("v", "ts", "type", "prev_hash")
+        }
         detail = " ".join(f"{k}={v}" for k, v in list(rest.items())[:4])
     return f"{ts}  {rtype:16} {detail}".rstrip()
 
@@ -464,7 +460,9 @@ def _parse_since(raw: str) -> datetime:
 
 
 def cmd_audit(
-    *, verify: bool = False, since: str | None = None,
+    *,
+    verify: bool = False,
+    since: str | None = None,
     as_json: bool = False,
 ) -> int:
     """Show the audit log; --verify re-checks chain + signatures."""
@@ -490,8 +488,7 @@ def cmd_audit(
             print(f"error: {exc}", file=sys.stderr)
             return 2
         records = [
-            (n, r) for n, r in records
-            if datetime.fromisoformat(r["ts"]) >= cutoff
+            (n, r) for n, r in records if datetime.fromisoformat(r["ts"]) >= cutoff
         ]
     if as_json:
         for _n, record in records:
@@ -511,9 +508,7 @@ def _run_workspace(policy, digest: str) -> Path:
     return Path(policy.fs_write[0])
 
 
-def cmd_snapshot(
-    policy_file: str | None, message: str | None = None
-) -> int:
+def cmd_snapshot(policy_file: str | None, message: str | None = None) -> int:
     """Snapshot the policy's first writable mount (host-side)."""
     try:
         policy_path = resolve_policy_path(policy_file)
@@ -547,13 +542,18 @@ def cmd_snapshots(*, as_json: bool = False) -> int:
     metas = snapshots.list_snapshots(data_dir())
     if as_json:
         for meta in metas:
-            print(json.dumps({
-                "snap_id": meta.snap_id,
-                "ts": meta.ts_iso,
-                "message": meta.message,
-                "workspace": meta.workspace,
-                "files": meta.files,
-            }, sort_keys=True))
+            print(
+                json.dumps(
+                    {
+                        "snap_id": meta.snap_id,
+                        "ts": meta.ts_iso,
+                        "message": meta.message,
+                        "workspace": meta.workspace,
+                        "files": meta.files,
+                    },
+                    sort_keys=True,
+                )
+            )
     else:
         for meta in metas:
             msg = f" — {meta.message}" if meta.message else ""
@@ -623,20 +623,28 @@ def cmd_doctor(as_json: bool = False) -> int:
     try:
         bwrap = find_bwrap()
         ok &= _check(
-            "bwrap on PATH", "PASS", f"found {bwrap}",
-            checks=checks, emit=emit,
+            "bwrap on PATH",
+            "PASS",
+            f"found {bwrap}",
+            checks=checks,
+            emit=emit,
         )
     except SandboxError:
         ok &= _check(
-            "bwrap on PATH", "FAIL", "install bubblewrap "
-            "(e.g. `apt install bubblewrap`)",
-            checks=checks, emit=emit,
+            "bwrap on PATH",
+            "FAIL",
+            "install bubblewrap (e.g. `apt install bubblewrap`)",
+            checks=checks,
+            emit=emit,
         )
 
     if bwrap is not None and probe_userns(bwrap, with_proc=False):
         ok &= _check(
-            "user namespaces usable", "PASS", "bwrap probe ran",
-            checks=checks, emit=emit,
+            "user namespaces usable",
+            "PASS",
+            "bwrap probe ran",
+            checks=checks,
+            emit=emit,
         )
     else:
         ok &= _check(
@@ -650,15 +658,17 @@ def cmd_doctor(as_json: bool = False) -> int:
 
     if bwrap is not None and proc_available(bwrap):
         ok &= _check(
-            "private /proc mountable", "PASS", "",
-            checks=checks, emit=emit,
+            "private /proc mountable",
+            "PASS",
+            "",
+            checks=checks,
+            emit=emit,
         )
     else:
         ok &= _check(
             "private /proc mountable",
             "WARN",
-            "no-proc fallback will run workloads without /proc "
-            "(isolation unaffected)",
+            "no-proc fallback will run workloads without /proc (isolation unaffected)",
             checks=checks,
             emit=emit,
         )
@@ -670,8 +680,11 @@ def cmd_doctor(as_json: bool = False) -> int:
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
         ok &= _check(
-            "audit dir writable", "PASS", f"{directory}",
-            checks=checks, emit=emit,
+            "audit dir writable",
+            "PASS",
+            f"{directory}",
+            checks=checks,
+            emit=emit,
         )
     except OSError as exc:
         ok &= _check(
@@ -688,30 +701,36 @@ def cmd_doctor(as_json: bool = False) -> int:
 
 
 def _add_run_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--policy", default=None,
-                        help="policy file (default: resolution order)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="print the resolved policy (secrets masked) "
-                             "and the bwrap command without running anything")
     parser.add_argument(
-        "--yes", action="store_true",
-        help="deny every approval-gate ask without prompting "
-             "(for CI; fail-closed)",
+        "--policy", default=None, help="policy file (default: resolution order)"
     )
     parser.add_argument(
-        "--approve-all", action="store_true",
-        help="allow every approval-gate ask without prompting "
-             "(logged; discouraged)",
+        "--dry-run",
+        action="store_true",
+        help="print the resolved policy (secrets masked) "
+        "and the bwrap command without running anything",
     )
     parser.add_argument(
-        "--snapshot", action="store_true",
+        "--yes",
+        action="store_true",
+        help="deny every approval-gate ask without prompting (for CI; fail-closed)",
+    )
+    parser.add_argument(
+        "--approve-all",
+        action="store_true",
+        help="allow every approval-gate ask without prompting (logged; discouraged)",
+    )
+    parser.add_argument(
+        "--snapshot",
+        action="store_true",
         help="snapshot the first fs.write workspace before the run "
-             "(ignored with --dry-run)",
+        "(ignored with --dry-run)",
     )
     parser.add_argument(
-        "--auto-rollback", action="store_true",
+        "--auto-rollback",
+        action="store_true",
         help="restore the pre-run snapshot when the workload exits "
-             "non-zero (implies --snapshot; the restore is audited)",
+        "non-zero (implies --snapshot; the restore is audited)",
     )
 
 
@@ -727,14 +746,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = sub.add_parser("init", help="scaffold ./mantrap.yaml")
     p_init.add_argument(
-        "--force", action="store_true",
+        "--force",
+        action="store_true",
         help="overwrite an existing mantrap.yaml",
     )
 
     p_run = sub.add_parser("run", help="run a command in the sandbox")
     _add_run_flags(p_run)
     p_run.add_argument(
-        "workload", nargs=argparse.REMAINDER,
+        "workload",
+        nargs=argparse.REMAINDER,
         help="command after --, e.g. mantrap run -- id -u",
     )
 
@@ -744,64 +765,79 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_run_flags(p_exec)
     p_exec.add_argument(
-        "--add-write", action="append", default=None, metavar="PATH",
+        "--add-write",
+        action="append",
+        default=None,
+        metavar="PATH",
         help="grant the workload a writable mount for this run only "
-             "(repeatable; validated like fs.write)",
+        "(repeatable; validated like fs.write)",
     )
     p_exec.add_argument(
-        "workload", nargs=argparse.REMAINDER,
+        "workload",
+        nargs=argparse.REMAINDER,
         help="command after --, e.g. mantrap exec "
-             "--add-write /home/user/out -- make build",
+        "--add-write /home/user/out -- make build",
     )
 
     p_doctor = sub.add_parser("doctor", help="check the sandbox environment")
     p_doctor.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="print checks as JSON",
     )
 
-    p_keygen = sub.add_parser(
-        "keygen", help="create the audit-log signing key")
+    p_keygen = sub.add_parser("keygen", help="create the audit-log signing key")
     p_keygen.add_argument(
-        "--rotate", action="store_true",
+        "--rotate",
+        action="store_true",
         help="replace the existing key (old signatures stay verifiable)",
     )
 
     p_audit = sub.add_parser("audit", help="show the audit log")
     p_audit.add_argument(
-        "--verify", action="store_true",
+        "--verify",
+        action="store_true",
         help="re-check the hash chain and every signature; "
-             "exit 1 naming the first broken record",
+        "exit 1 naming the first broken record",
     )
     p_audit.add_argument(
-        "--since", default=None, metavar="TS",
+        "--since",
+        default=None,
+        metavar="TS",
         help="only show records at or after this ISO-8601 timestamp",
     )
     p_audit.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="print records as JSON (one per line)",
     )
 
     p_snapshot = sub.add_parser(
-        "snapshot", help="snapshot the policy's writable workspace")
-    p_snapshot.add_argument("--policy", default=None,
-                            help="policy file (default: resolution order)")
+        "snapshot", help="snapshot the policy's writable workspace"
+    )
     p_snapshot.add_argument(
-        "--message", default=None,
+        "--policy", default=None, help="policy file (default: resolution order)"
+    )
+    p_snapshot.add_argument(
+        "--message",
+        default=None,
         help="label stored with the snapshot",
     )
 
     p_snapshots = sub.add_parser("snapshots", help="list snapshots")
     p_snapshots.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="print snapshots as JSON (one per line)",
     )
 
     p_rollback = sub.add_parser(
-        "rollback", help="restore the workspace from a snapshot")
+        "rollback", help="restore the workspace from a snapshot"
+    )
     p_rollback.add_argument("snap_id", help="snapshot id from `snapshots`")
     p_rollback.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="show what would change without restoring anything",
     )
     return parser
@@ -831,8 +867,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             yes=args.yes,
             approve_all=args.approve_all,
-            add_writes=args.add_write
-            if args.command == "exec" else None,
+            add_writes=args.add_write if args.command == "exec" else None,
             command_name=args.command,
             snapshot=args.snapshot,
             auto_rollback=args.auto_rollback,
@@ -842,9 +877,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "keygen":
         return cmd_keygen(rotate=args.rotate)
     if args.command == "audit":
-        return cmd_audit(
-            verify=args.verify, since=args.since, as_json=args.json
-        )
+        return cmd_audit(verify=args.verify, since=args.since, as_json=args.json)
     if args.command == "snapshot":
         return cmd_snapshot(args.policy, message=args.message)
     if args.command == "snapshots":

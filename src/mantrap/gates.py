@@ -102,14 +102,12 @@ def parse_gates(raw: object) -> list[GateRule]:
             raise GateError(f"{where}: match pattern must be a non-empty string")
         if kind == "fs.write" and not os.path.isabs(pattern):
             raise GateError(
-                f"{where}: fs.write pattern must be an absolute path "
-                f"(got {pattern!r})"
+                f"{where}: fs.write pattern must be an absolute path (got {pattern!r})"
             )
         action = entry["action"]
         if action not in ACTIONS:
             raise GateError(
-                f"{where}: action must be one of {', '.join(ACTIONS)} "
-                f"(got {action!r})"
+                f"{where}: action must be one of {', '.join(ACTIONS)} (got {action!r})"
             )
         if kind in ("exec.path", "fs.write"):
             # resolve symlink spellings: a rule must match every alias of the same file
@@ -240,9 +238,7 @@ class GateSession:
             return list(dict.fromkeys([argv0, os.path.realpath(argv0)]))
         resolved = shutil.which(argv0)
         if resolved:
-            return list(
-                dict.fromkeys([argv0, resolved, os.path.realpath(resolved)])
-            )
+            return list(dict.fromkeys([argv0, resolved, os.path.realpath(resolved)]))
         return [argv0]
 
     def check_exec_path(self, argv0: str) -> Literal["allow"]:
@@ -345,8 +341,7 @@ class GateSession:
                     pass
         if answer is None:
             print(
-                "[mantrap] no terminal for approval prompt; "
-                f"denying: {detail}",
+                f"[mantrap] no terminal for approval prompt; denying: {detail}",
                 file=sys.stderr,
             )
             self.audit_gate(rule, "deny", "no-tty", detail)

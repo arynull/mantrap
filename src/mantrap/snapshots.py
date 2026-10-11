@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404  # fixed rsync argv, no shell
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,9 +42,7 @@ class SnapshotMeta:
 def _rsync() -> str:
     exe = shutil.which("rsync")
     if exe is None:
-        raise SnapshotError(
-            "rsync is required for snapshots but was not found on PATH"
-        )
+        raise SnapshotError("rsync is required for snapshots but was not found on PATH")
     return exe
 
 
@@ -58,7 +56,7 @@ def _hash_file(path: Path) -> str:
 
 def _scan(workspace: Path) -> list[dict]:
     """Manifest entries for every regular file under workspace."""
-    entries = []
+    entries: list[dict] = []
     for root, _dirs, files in os.walk(workspace):
         for name in files:
             full = Path(root) / name
@@ -105,7 +103,7 @@ def create_snapshot(
     data_dest = dest / DATA_DIRNAME
     data_dest.mkdir(parents=True)
     try:
-        proc = subprocess.run(
+        proc = subprocess.run(  # nosec B603  # fixed rsync argv, no shell
             [rsync, "-a", "--delete", str(workspace) + "/", str(data_dest) + "/"],
             capture_output=True,
             text=True,
@@ -128,11 +126,11 @@ def create_snapshot(
         json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return SnapshotMeta(
-        snap_id=meta["snap_id"],
+        snap_id=str(meta["snap_id"]),
         policy_sha8=policy_sha8,
         timestamp=stamp,
-        ts_iso=meta["ts"],
-        message=meta["message"],
+        ts_iso=str(meta["ts"]),
+        message=str(meta["message"]),
         workspace=str(workspace),
         files=len(entries),
         path=dest,
@@ -206,9 +204,7 @@ def diff_workspace(meta: SnapshotMeta) -> list[FileDiff]:
     the snapshot but missing from the workspace, "modified" = present
     in both with different content.
     """
-    manifest = json.loads(
-        (meta.path / MANIFEST_FILENAME).read_text(encoding="utf-8")
-    )
+    manifest = json.loads((meta.path / MANIFEST_FILENAME).read_text(encoding="utf-8"))
     snap_files = {e["path"]: e for e in manifest.get("files", [])}
     workspace = Path(meta.workspace)
     live = {e["path"]: e for e in _scan(workspace)} if workspace.is_dir() else {}
@@ -227,9 +223,7 @@ def diff_workspace(meta: SnapshotMeta) -> list[FileDiff]:
     return diffs
 
 
-def rollback(
-    meta: SnapshotMeta, *, dry_run: bool = False
-) -> list[FileDiff]:
+def rollback(meta: SnapshotMeta, *, dry_run: bool = False) -> list[FileDiff]:
     """Restore the workspace from the snapshot.
 
     With dry_run, only computes and returns the diff. Otherwise
@@ -245,7 +239,7 @@ def rollback(
     rsync = _rsync()
     data_src = meta.path / DATA_DIRNAME
     try:
-        proc = subprocess.run(
+        proc = subprocess.run(  # nosec B603  # fixed rsync argv, no shell
             [rsync, "-a", "--delete", str(data_src) + "/", str(workspace) + "/"],
             capture_output=True,
             text=True,

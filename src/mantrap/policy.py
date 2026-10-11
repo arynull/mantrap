@@ -27,7 +27,11 @@ KNOWN_TOP_KEYS = {"fs", "env", "limits", "network", "secrets", "gates"}
 KNOWN_FS_KEYS = {"read", "write"}
 KNOWN_ENV_KEYS = {"allow"}
 KNOWN_LIMIT_KEYS = {
-    "timeout", "memory", "cpu_seconds", "nproc", "seccomp",
+    "timeout",
+    "memory",
+    "cpu_seconds",
+    "nproc",
+    "seccomp",
     "audit_max_mb",
 }
 SECCOMP_LEVELS = ("off", "default", "strict")
@@ -122,30 +126,22 @@ def validate_write_path(raw: str, key: str) -> str:
     `exec --add-write` CLI flag so both enforce the same rule.
     """
     if not os.path.isabs(raw):
-        raise PolicyError(
-            f"policy path must be absolute: {key} entry {raw!r}"
-        )
+        raise PolicyError(f"policy path must be absolute: {key} entry {raw!r}")
     # Reject ".." outright: "resolve outside themselves" is
     # undecidable textually once symlinks are involved, so any
     # parent-component is fail-closed rather than normalized away.
     if ".." in raw.split("/"):
-        raise PolicyError(
-            f"policy path must not contain '..': {key} entry {raw!r}"
-        )
+        raise PolicyError(f"policy path must not contain '..': {key} entry {raw!r}")
     normalized = os.path.normpath(raw)
     if not os.path.exists(normalized):
-        raise PolicyError(
-            f"policy path does not exist: {key} entry {raw!r}"
-        )
+        raise PolicyError(f"policy path does not exist: {key} entry {raw!r}")
     return normalized
 
 
 def _check_path_list(entries: object, key: str) -> list[str]:
     if entries is None:
         return []
-    if not isinstance(entries, list) or not all(
-        isinstance(e, str) for e in entries
-    ):
+    if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
         raise PolicyError(f"policy key {key!r} must be a list of strings")
     return [validate_write_path(raw, key) for raw in entries]
 
@@ -215,9 +211,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
     allow = env.get("allow", [])
     if allow is None:
         allow = []
-    if not isinstance(allow, list) or not all(
-        isinstance(e, str) for e in allow
-    ):
+    if not isinstance(allow, list) or not all(isinstance(e, str) for e in allow):
         raise PolicyError("policy key 'env.allow' must be a list of strings")
     for name in allow:
         if "*" in name:
@@ -254,17 +248,13 @@ def load_policy(path: Path) -> tuple[Policy, str]:
     audit_max_mb = limits.get("audit_max_mb", 512)
     if audit_max_mb is None:
         audit_max_mb = 512
-    if isinstance(audit_max_mb, bool) or not isinstance(
-        audit_max_mb, (int, float)
-    ):
+    if isinstance(audit_max_mb, bool) or not isinstance(audit_max_mb, (int, float)):
         raise PolicyError(
-            "policy key 'limits.audit_max_mb' must be a number "
-            "(0 disables the cap)"
+            "policy key 'limits.audit_max_mb' must be a number (0 disables the cap)"
         )
     if audit_max_mb < 0:
         raise PolicyError(
-            "policy key 'limits.audit_max_mb' must be non-negative "
-            "(0 disables the cap)"
+            "policy key 'limits.audit_max_mb' must be non-negative (0 disables the cap)"
         )
 
     network = data.get("network", {})
@@ -302,14 +292,11 @@ def load_policy(path: Path) -> tuple[Policy, str]:
         isinstance(e, str) and e for e in allow_domains
     ):
         raise PolicyError(
-            "policy key 'network.allow_domains' must be a list "
-            "of non-empty strings"
+            "policy key 'network.allow_domains' must be a list of non-empty strings"
         )
     allow_plain_http = network.get("allow_plain_http", False)
     if not isinstance(allow_plain_http, bool):
-        raise PolicyError(
-            "policy key 'network.allow_plain_http' must be a boolean"
-        )
+        raise PolicyError("policy key 'network.allow_plain_http' must be a boolean")
     allow_ports = network.get("allow_ports", [443])
     if allow_ports is None:
         allow_ports = [443]
@@ -337,9 +324,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
     dns_pin_ttl = network.get("dns_pin_ttl", DEFAULT_DNS_PIN_TTL)
     if dns_pin_ttl is None:
         dns_pin_ttl = DEFAULT_DNS_PIN_TTL
-    if isinstance(dns_pin_ttl, bool) or not isinstance(
-        dns_pin_ttl, int
-    ):
+    if isinstance(dns_pin_ttl, bool) or not isinstance(dns_pin_ttl, int):
         raise PolicyError(
             "policy key 'network.dns_pin_ttl' must be a "
             "non-negative integer number of seconds (default 60, "
@@ -347,14 +332,11 @@ def load_policy(path: Path) -> tuple[Policy, str]:
         )
     if dns_pin_ttl < 0:
         raise PolicyError(
-            "policy key 'network.dns_pin_ttl' must be >= 0 "
-            "(0 disables DNS pinning)"
+            "policy key 'network.dns_pin_ttl' must be >= 0 (0 disables DNS pinning)"
         )
     allow_private_ips = network.get("allow_private_ips", False)
     if not isinstance(allow_private_ips, bool):
-        raise PolicyError(
-            "policy key 'network.allow_private_ips' must be a boolean"
-        )
+        raise PolicyError("policy key 'network.allow_private_ips' must be a boolean")
 
     raw_secrets = data.get("secrets", {})
     if raw_secrets is None:
@@ -365,8 +347,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
     for name, entry in raw_secrets.items():
         if not isinstance(name, str) or not SECRET_NAME_RE.match(name):
             raise PolicyError(
-                f"invalid secret name {name!r}: must match "
-                "[A-Za-z_][A-Za-z0-9_]*"
+                f"invalid secret name {name!r}: must match [A-Za-z_][A-Za-z0-9_]*"
             )
         if (
             not isinstance(entry, dict)
@@ -380,8 +361,7 @@ def load_policy(path: Path) -> tuple[Policy, str]:
         kind, arg = next(iter(entry.items()))
         if not isinstance(arg, str) or not arg:
             raise PolicyError(
-                f"secret {name!r}: source argument must be a non-empty "
-                "string"
+                f"secret {name!r}: source argument must be a non-empty string"
             )
         if name in allow:
             raise PolicyError(

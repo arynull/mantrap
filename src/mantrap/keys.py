@@ -88,10 +88,13 @@ def _write_keyring(directory: Path, keyring: dict[str, bytes]) -> None:
     """Persist the public-key ring (0600), replacing atomically."""
     path = keyring_path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        {key_id: pub.hex() for key_id, pub in sorted(keyring.items())},
-        sort_keys=True,
-    ) + "\n"
+    payload = (
+        json.dumps(
+            {key_id: pub.hex() for key_id, pub in sorted(keyring.items())},
+            sort_keys=True,
+        )
+        + "\n"
+    )
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, KEYRING_MODE)
     try:
@@ -110,9 +113,7 @@ def _write_keyring(directory: Path, keyring: dict[str, bytes]) -> None:
         raise KeyError(f"cannot write keyring {path}: {exc}") from exc
 
 
-def add_public_key(
-    directory: Path, key_id: str, public_key: bytes
-) -> None:
+def add_public_key(directory: Path, key_id: str, public_key: bytes) -> None:
     """Record a public key in the ring (maintained by generate/rotate)."""
     keyring = _read_keyring_file(directory) or {}
     keyring[key_id] = public_key
@@ -183,9 +184,7 @@ def load_keyring(directory: Path) -> dict[str, bytes]:
                         f"cannot rebuild keyring from the audit log: {error}"
                     )
     except audit.AuditError as exc:
-        raise KeyError(
-            f"cannot rebuild keyring from the audit log: {exc}"
-        ) from exc
+        raise KeyError(f"cannot rebuild keyring from the audit log: {exc}") from exc
     if not found:
         return {}
     # Trust nothing that verify_log does not also accept.

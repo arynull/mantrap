@@ -79,8 +79,7 @@ def set_size_cap_bytes(n: int | None) -> None:
         return
     if isinstance(n, bool) or not isinstance(n, int) or n < 0:
         raise AuditError(
-            f"audit size cap must be a non-negative int of bytes, "
-            f"got {n!r}"
+            f"audit size cap must be a non-negative int of bytes, got {n!r}"
         )
     _size_cap_bytes = n
 
@@ -92,9 +91,7 @@ def _log_size_bytes(target_dir: Path) -> int:
     return target.stat().st_size
 
 
-def check_capacity(
-    extra_bytes: int = 0, directory: Path | None = None
-) -> None:
+def check_capacity(extra_bytes: int = 0, directory: Path | None = None) -> None:
     """Fail-closed capacity preflight: the next write fits in the cap.
 
     Raises AuditFullError (naming the remedy) when
@@ -202,9 +199,9 @@ def _write_tip(target_dir: Path, tip_hash: str, records: int) -> None:
     """
     path = tip_path(target_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        {"tip_hash": tip_hash, "records": records}, sort_keys=True
-    ) + "\n"
+    payload = (
+        json.dumps({"tip_hash": tip_hash, "records": records}, sort_keys=True) + "\n"
+    )
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix="audit.tip.", suffix=".tmp"
     )
@@ -221,9 +218,7 @@ def _write_tip(target_dir: Path, tip_hash: str, records: int) -> None:
             os.unlink(tmp_name)
         except OSError:
             pass
-        raise AuditError(
-            f"cannot write audit tip sentinel {path}: {exc}"
-        ) from exc
+        raise AuditError(f"cannot write audit tip sentinel {path}: {exc}") from exc
 
 
 def _read_tip(target_dir: Path) -> dict | None:
@@ -234,13 +229,9 @@ def _read_tip(target_dir: Path) -> dict | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise AuditError(
-            f"audit tip sentinel {path} is unreadable: {exc}"
-        ) from exc
+        raise AuditError(f"audit tip sentinel {path} is unreadable: {exc}") from exc
     if not isinstance(data, dict):
-        raise AuditError(
-            f"audit tip sentinel {path} is not a JSON object"
-        )
+        raise AuditError(f"audit tip sentinel {path} is not a JSON object")
     return data
 
 
@@ -314,17 +305,13 @@ def iter_records(directory: Path | None = None):
     target = target_dir / AUDIT_FILENAME
     if not target.exists():
         return
-    for lineno, line in enumerate(
-        target.read_text(encoding="utf-8").splitlines(), 1
-    ):
+    for lineno, line in enumerate(target.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
         try:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise AuditError(
-                f"record #{lineno}: not valid JSON ({exc})"
-            ) from exc
+            raise AuditError(f"record #{lineno}: not valid JSON ({exc})") from exc
         if not isinstance(record, dict):
             raise AuditError(f"record #{lineno}: not a JSON object")
         yield lineno, record
@@ -399,18 +386,13 @@ def check_signature(
         sig = bytes.fromhex(sig_hex)
     except ValueError:
         return f"record #{lineno} (sig): malformed tip_hash/signature"
-    if prev_record is None or record.get("tip_hash") != record_hash(
-        prev_record
-    ):
+    if prev_record is None or record.get("tip_hash") != record_hash(prev_record):
         return (
             f"record #{lineno} (sig): tip_hash does not match "
             f"record #{prev_lineno} — the log was modified"
         )
     if not _ed25519.verify(keyring[key_id], tip, sig):
-        return (
-            f"record #{lineno} (sig): bad Ed25519 signature "
-            f"(key {key_id})"
-        )
+        return f"record #{lineno} (sig): bad Ed25519 signature (key {key_id})"
     return None
 
 
@@ -443,16 +425,12 @@ def verify_tip(directory: Path | None = None) -> VerifyResult:
     try:
         tip = _read_tip(target_dir)
     except AuditError as exc:
-        return VerifyResult(
-            ok=False, records=0, signatures=0, error=str(exc)
-        )
+        return VerifyResult(ok=False, records=0, signatures=0, error=str(exc))
 
     try:
         records = list(iter_records(target_dir))
     except AuditError as exc:
-        return VerifyResult(
-            ok=False, records=0, signatures=0, error=str(exc)
-        )
+        return VerifyResult(ok=False, records=0, signatures=0, error=str(exc))
 
     if not records:
         if tip is not None:
@@ -461,8 +439,7 @@ def verify_tip(directory: Path | None = None) -> VerifyResult:
                 records=0,
                 signatures=0,
                 error=(
-                    "audit log missing — expected "
-                    f"{tip.get('records', '?')} records"
+                    f"audit log missing — expected {tip.get('records', '?')} records"
                 ),
             )
         return VerifyResult(ok=True, records=0, signatures=0)
@@ -473,9 +450,7 @@ def verify_tip(directory: Path | None = None) -> VerifyResult:
     if tip is not None:
         expected_count = tip.get("records")
         expected_tip = tip.get("tip_hash")
-        if not isinstance(expected_count, int) or not isinstance(
-            expected_tip, str
-        ):
+        if not isinstance(expected_count, int) or not isinstance(expected_tip, str):
             return VerifyResult(
                 ok=False,
                 records=total,
@@ -527,9 +502,7 @@ def verify_tip(directory: Path | None = None) -> VerifyResult:
         rtype = record.get("type", "?")
         if "prev_hash" in record:
             expected_link = (
-                GENESIS_HASH
-                if prev_record is None
-                else record_hash(prev_record)
+                GENESIS_HASH if prev_record is None else record_hash(prev_record)
             )
             if record["prev_hash"] != expected_link:
                 return VerifyResult(
@@ -563,9 +536,7 @@ def verify_tip(directory: Path | None = None) -> VerifyResult:
         return verify_log(target_dir)
 
     lineno, record = last_sig
-    error = check_signature(
-        keyring, record, lineno, sig_prev, sig_prev_lineno
-    )
+    error = check_signature(keyring, record, lineno, sig_prev, sig_prev_lineno)
     if error is not None:
         return VerifyResult(
             ok=False,
@@ -596,11 +567,7 @@ def verify_log(directory: Path | None = None) -> VerifyResult:
         total = lineno
         rtype = record.get("type", "?")
         if "prev_hash" in record:
-            expected = (
-                GENESIS_HASH
-                if prev_record is None
-                else record_hash(prev_record)
-            )
+            expected = GENESIS_HASH if prev_record is None else record_hash(prev_record)
             if record["prev_hash"] != expected:
                 return VerifyResult(
                     ok=False,
@@ -624,9 +591,7 @@ def verify_log(directory: Path | None = None) -> VerifyResult:
                 )
         elif rtype == "sig":
             sig_count += 1
-            error = check_signature(
-                keyring, record, lineno, prev_record, prev_lineno
-            )
+            error = check_signature(keyring, record, lineno, prev_record, prev_lineno)
             if error is not None:
                 return VerifyResult(
                     ok=False,

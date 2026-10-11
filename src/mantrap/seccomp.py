@@ -199,9 +199,7 @@ def blocked_numbers(level: str, arch: str | None = None) -> list[int]:
     try:
         return [table[name] for name in names]
     except KeyError as exc:
-        raise SeccompError(
-            f"no syscall number for {exc} on {arch}"
-        ) from exc
+        raise SeccompError(f"no syscall number for {exc} on {arch}") from exc
 
 
 def build_filter(level: str, arch: str | None = None) -> bytes:
@@ -215,9 +213,7 @@ def build_filter(level: str, arch: str | None = None) -> bytes:
         jt = kill_index - (1 + i) - 1  # forward jump to KILL on match
         insns.append(struct.pack("<HBBI", _BPF_JEQ_K, jt, 0, nr))
     insns.append(struct.pack("<HBBI", _BPF_RET_K, 0, 0, _SECCOMP_RET_ALLOW))
-    insns.append(
-        struct.pack("<HBBI", _BPF_RET_K, 0, 0, _SECCOMP_RET_KILL_PROCESS)
-    )
+    insns.append(struct.pack("<HBBI", _BPF_RET_K, 0, 0, _SECCOMP_RET_KILL_PROCESS))
     return b"".join(insns)
 
 

@@ -130,9 +130,7 @@ def validate_pin_ttl(value) -> float:
     inverting) pinning inside the engine.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(
-            f"dns_pin_ttl must be a non-negative number (got {value!r})"
-        )
+        raise ValueError(f"dns_pin_ttl must be a non-negative number (got {value!r})")
     if value < 0:
         raise ValueError(
             f"dns_pin_ttl must be >= 0, 0 disables pinning (got {value!r})"
@@ -149,6 +147,7 @@ def system_resolve(host: str) -> list[str]:
     """
     infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     return sorted({str(info[4][0]) for info in infos})
+
 
 HOP_BY_HOP = frozenset(
     {
@@ -474,9 +473,7 @@ class DnsPinMap:
     """
 
     def __init__(self, max_entries: int = PIN_MAP_MAX) -> None:
-        self._pins: OrderedDict[str, tuple[list[str], float]] = (
-            OrderedDict()
-        )
+        self._pins: OrderedDict[str, tuple[list[str], float]] = OrderedDict()
         self._lock = threading.Lock()
         self.max_entries = max_entries
 
@@ -538,8 +535,14 @@ class FilteringProxy:
     in turn.
     """
 
-    def __init__(self, net_config, audit_append=None, gate_check=None,
-                 resolver_fn=None, pin_map=None):
+    def __init__(
+        self,
+        net_config,
+        audit_append=None,
+        gate_check=None,
+        resolver_fn=None,
+        pin_map=None,
+    ):
         self.allow_domains = list(net_config.allow_domains)
         self.allow_plain_http = net_config.allow_plain_http
         self.allow_ports = list(net_config.allow_ports)
@@ -557,8 +560,16 @@ class FilteringProxy:
         self.resolver_fn = resolver_fn or system_resolve
         self.pins = pin_map if pin_map is not None else DnsPinMap()
 
-    def audit(self, *, type: str, domain: str, port: int,
-              scheme: str, decision: str, reason: str) -> None:
+    def audit(
+        self,
+        *,
+        type: str,
+        domain: str,
+        port: int,
+        scheme: str,
+        decision: str,
+        reason: str,
+    ) -> None:
         if self.audit_exhausted:
             # The cap is fatal for new connections: skip further
             # appends (no per-connection stderr spam).
@@ -589,11 +600,16 @@ class FilteringProxy:
         except Exception as exc:  # noqa: BLE001 - never crash on audit
             print(f"proxy: audit append failed: {exc}")
 
-    def deny(self, conn: socket.socket, *, domain: str, port: int,
-             scheme: str, reason: str) -> None:
+    def deny(
+        self, conn: socket.socket, *, domain: str, port: int, scheme: str, reason: str
+    ) -> None:
         self.audit(
-            type="net.deny", domain=domain, port=port,
-            scheme=scheme, decision="deny", reason=reason,
+            type="net.deny",
+            domain=domain,
+            port=port,
+            scheme=scheme,
+            decision="deny",
+            reason=reason,
         )
         body = f"forbidden: {reason}\n".encode()
         try:
@@ -677,22 +693,17 @@ class FilteringProxy:
         ]
         return [("Host", pinned), *kept]
 
-    def connect_upstream(
-        self, ips: list[str], port: int
-    ) -> socket.socket | None:
+    def connect_upstream(self, ips: list[str], port: int) -> socket.socket | None:
         for ip in ips:
             try:
-                return socket.create_connection(
-                    (ip, port), timeout=CONNECT_TIMEOUT_S
-                )
+                return socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT_S)
             except OSError:
                 continue
         return None
 
     @staticmethod
     def send_error(conn: socket.socket, status: int, reason: str) -> None:
-        phrases = {400: "Bad Request", 408: "Request Timeout",
-                   502: "Bad Gateway"}
+        phrases = {400: "Bad Request", 408: "Request Timeout", 502: "Bad Gateway"}
         phrase = phrases.get(status, "Error")
         body = f"{status} {phrase}: {reason}\n".encode()
         try:
@@ -723,40 +734,74 @@ class FilteringProxy:
             decision = "deny"
         return decision != "deny"
 
-    def handle_connect(
-        self, conn: socket.socket, host: str, port: int
-    ) -> None:
+    def handle_connect(self, conn: socket.socket, host: str, port: int) -> None:
         if self.audit_exhausted:
-            self.deny(conn, domain=strip_brackets(host), port=port,
-                      scheme="connect", reason="audit_log_full")
+            self.deny(
+                conn,
+                domain=strip_brackets(host),
+                port=port,
+                scheme="connect",
+                reason="audit_log_full",
+            )
             return
         if is_metadata_endpoint(host):
-            self.deny(conn, domain=strip_brackets(host), port=port,
-                      scheme="connect", reason="metadata_blocklisted")
+            self.deny(
+                conn,
+                domain=strip_brackets(host),
+                port=port,
+                scheme="connect",
+                reason="metadata_blocklisted",
+            )
             return
         if not domain_allowed(host, self.allow_domains):
-            self.deny(conn, domain=strip_brackets(host), port=port,
-                      scheme="connect", reason="not_allowlisted")
+            self.deny(
+                conn,
+                domain=strip_brackets(host),
+                port=port,
+                scheme="connect",
+                reason="not_allowlisted",
+            )
             return
         if port not in self.allow_ports:
-            self.deny(conn, domain=strip_brackets(host), port=port,
-                      scheme="connect", reason="port_not_allowed")
+            self.deny(
+                conn,
+                domain=strip_brackets(host),
+                port=port,
+                scheme="connect",
+                reason="port_not_allowed",
+            )
             return
         ips, error = self.resolve(host)
         if ips is None:
-            assert error is not None
-            self.deny(conn, domain=strip_brackets(host), port=port,
-                      scheme="connect", reason=error)
+            assert error is not None  # nosec B101  # resolve sets error iff ips is None
+            self.deny(
+                conn,
+                domain=strip_brackets(host),
+                port=port,
+                scheme="connect",
+                reason=error,
+            )
             return
         blocked = self.guard(ips)
         if blocked is not None:
-            self.deny(conn, domain=strip_brackets(host), port=port,
-                      scheme="connect", reason=blocked)
+            self.deny(
+                conn,
+                domain=strip_brackets(host),
+                port=port,
+                scheme="connect",
+                reason=blocked,
+            )
             return
-        if not self.gate_allows(domain=strip_brackets(host), port=port,
-                                scheme="connect"):
-            self.deny(conn, domain=strip_brackets(host), port=port,
-                      scheme="connect", reason="gate_denied")
+        if not self.gate_allows(
+            domain=strip_brackets(host), port=port, scheme="connect"
+        ):
+            self.deny(
+                conn,
+                domain=strip_brackets(host),
+                port=port,
+                scheme="connect",
+                reason="gate_denied",
+            )
             return
         parent = parent_proxy_from_env()
         if parent is not None:
@@ -764,9 +809,14 @@ class FilteringProxy:
             return
         upstream = self.connect_upstream(ips, port)
         if upstream is None:
-            self.audit(type="net.allow", domain=strip_brackets(host),
-                       port=port, scheme="connect", decision="allow",
-                       reason="upstream_failed")
+            self.audit(
+                type="net.allow",
+                domain=strip_brackets(host),
+                port=port,
+                scheme="connect",
+                decision="allow",
+                reason="upstream_failed",
+            )
             self.send_error(conn, 502, "upstream connect failed")
             return
         try:
@@ -774,25 +824,34 @@ class FilteringProxy:
         except OSError:
             upstream.close()
             return
-        self.audit(type="net.allow", domain=strip_brackets(host),
-                   port=port, scheme="connect", decision="allow",
-                   reason="ok")
+        self.audit(
+            type="net.allow",
+            domain=strip_brackets(host),
+            port=port,
+            scheme="connect",
+            decision="allow",
+            reason="ok",
+        )
         try:
             splice(conn, upstream)
         finally:
             upstream.close()
 
-    def chain_connect(self, conn: socket.socket,
-                      parent: tuple[str, int], host: str, port: int) -> None:
+    def chain_connect(
+        self, conn: socket.socket, parent: tuple[str, int], host: str, port: int
+    ) -> None:
         domain = strip_brackets(host)
         try:
-            upstream = socket.create_connection(
-                parent, timeout=CONNECT_TIMEOUT_S
-            )
+            upstream = socket.create_connection(parent, timeout=CONNECT_TIMEOUT_S)
         except OSError:
-            self.audit(type="net.allow", domain=domain, port=port,
-                       scheme="connect", decision="allow",
-                       reason="upstream_failed")
+            self.audit(
+                type="net.allow",
+                domain=domain,
+                port=port,
+                scheme="connect",
+                decision="allow",
+                reason="upstream_failed",
+            )
             self.send_error(conn, 502, "parent proxy unreachable")
             return
         try:
@@ -808,8 +867,14 @@ class FilteringProxy:
                 raise _HttpError(502, "parent proxy refused CONNECT")
         except (TimeoutError, _HttpError, OSError) as exc:
             reason = getattr(exc, "reason", None) or "upstream_failed"
-            self.audit(type="net.allow", domain=domain, port=port,
-                       scheme="connect", decision="allow", reason=reason)
+            self.audit(
+                type="net.allow",
+                domain=domain,
+                port=port,
+                scheme="connect",
+                decision="allow",
+                reason=reason,
+            )
             self.send_error(conn, 502, str(reason))
             upstream.close()
             return
@@ -818,59 +883,84 @@ class FilteringProxy:
         except OSError:
             upstream.close()
             return
-        self.audit(type="net.allow", domain=domain, port=port,
-                   scheme="connect", decision="allow", reason="ok")
+        self.audit(
+            type="net.allow",
+            domain=domain,
+            port=port,
+            scheme="connect",
+            decision="allow",
+            reason="ok",
+        )
         try:
             splice(conn, upstream)
         finally:
             upstream.close()
 
-    def handle_plain(self, conn: socket.socket, method: str,
-                     target: str,
-                     headers: list[tuple[str, str]]) -> None:
+    def handle_plain(
+        self,
+        conn: socket.socket,
+        method: str,
+        target: str,
+        headers: list[tuple[str, str]],
+    ) -> None:
         host, port, origin = parse_absolute_uri(target)
         domain = strip_brackets(host)
         if self.audit_exhausted:
-            self.deny(conn, domain=domain, port=port,
-                      scheme="http", reason="audit_log_full")
+            self.deny(
+                conn, domain=domain, port=port, scheme="http", reason="audit_log_full"
+            )
             return
         if is_metadata_endpoint(host):
-            self.deny(conn, domain=domain, port=port,
-                      scheme="http", reason="metadata_blocklisted")
+            self.deny(
+                conn,
+                domain=domain,
+                port=port,
+                scheme="http",
+                reason="metadata_blocklisted",
+            )
             return
         if not domain_allowed(host, self.allow_domains):
-            self.deny(conn, domain=domain, port=port,
-                      scheme="http", reason="not_allowlisted")
+            self.deny(
+                conn, domain=domain, port=port, scheme="http", reason="not_allowlisted"
+            )
             return
         if not self.allow_plain_http:
-            self.deny(conn, domain=domain, port=port,
-                      scheme="http", reason="plain_http_disabled")
+            self.deny(
+                conn,
+                domain=domain,
+                port=port,
+                scheme="http",
+                reason="plain_http_disabled",
+            )
             return
         ips, error = self.resolve(host)
         if ips is None:
-            assert error is not None
-            self.deny(conn, domain=domain, port=port,
-                      scheme="http", reason=error)
+            assert error is not None  # nosec B101  # resolve sets error iff ips is None
+            self.deny(conn, domain=domain, port=port, scheme="http", reason=error)
             return
         blocked = self.guard(ips)
         if blocked is not None:
-            self.deny(conn, domain=domain, port=port,
-                      scheme="http", reason=blocked)
+            self.deny(conn, domain=domain, port=port, scheme="http", reason=blocked)
             return
         if not self.gate_allows(domain=domain, port=port, scheme="http"):
-            self.deny(conn, domain=domain, port=port,
-                      scheme="http", reason="gate_denied")
+            self.deny(
+                conn, domain=domain, port=port, scheme="http", reason="gate_denied"
+            )
             return
         parent = parent_proxy_from_env()
         if parent is not None:
-            self.chain_plain(conn, parent, method, target,
-                             headers, domain, port)
+            self.chain_plain(conn, parent, method, target, headers, domain, port)
             return
         upstream = self.connect_upstream(ips, port)
         if upstream is None:
-            self.audit(type="net.allow", domain=domain, port=port,
-                       scheme="http", decision="allow",
-                       reason="upstream_failed")
+            self.audit(
+                type="net.allow",
+                domain=domain,
+                port=port,
+                scheme="http",
+                decision="allow",
+                reason="upstream_failed",
+            )
             self.send_error(conn, 502, "upstream connect failed")
             return
         lines = [f"{method} {origin} HTTP/1.1"]
@@ -878,38 +968,58 @@ class FilteringProxy:
             lines.append(f"{name}: {value}")
         lines.append("Connection: close")
         try:
-            upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode(
-                "latin-1"))
+            upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
         except OSError:
             upstream.close()
-            self.audit(type="net.allow", domain=domain, port=port,
-                       scheme="http", decision="allow",
-                       reason="upstream_failed")
+            self.audit(
+                type="net.allow",
+                domain=domain,
+                port=port,
+                scheme="http",
+                decision="allow",
+                reason="upstream_failed",
+            )
             self.send_error(conn, 502, "upstream write failed")
             return
-        self.audit(type="net.allow", domain=domain, port=port,
-                   scheme="http", decision="allow", reason="ok")
+        self.audit(
+            type="net.allow",
+            domain=domain,
+            port=port,
+            scheme="http",
+            decision="allow",
+            reason="ok",
+        )
         try:
             splice(conn, upstream)
         finally:
             upstream.close()
 
-    def chain_plain(self, conn: socket.socket, parent: tuple[str, int],
-                    method: str, target: str,
-                    headers: list[tuple[str, str]],
-                    domain: str, port: int) -> None:
+    def chain_plain(
+        self,
+        conn: socket.socket,
+        parent: tuple[str, int],
+        method: str,
+        target: str,
+        headers: list[tuple[str, str]],
+        domain: str,
+        port: int,
+    ) -> None:
         if self.audit_exhausted:
-            self.deny(conn, domain=domain, port=port,
-                      scheme="http", reason="audit_log_full")
+            self.deny(
+                conn, domain=domain, port=port, scheme="http", reason="audit_log_full"
+            )
             return
         try:
-            upstream = socket.create_connection(
-                parent, timeout=CONNECT_TIMEOUT_S
-            )
+            upstream = socket.create_connection(parent, timeout=CONNECT_TIMEOUT_S)
         except OSError:
-            self.audit(type="net.allow", domain=domain, port=port,
-                       scheme="http", decision="allow",
-                       reason="upstream_failed")
+            self.audit(
+                type="net.allow",
+                domain=domain,
+                port=port,
+                scheme="http",
+                decision="allow",
+                reason="upstream_failed",
+            )
             self.send_error(conn, 502, "parent proxy unreachable")
             return
         lines = [f"{method} {target} HTTP/1.1"]
@@ -917,17 +1027,27 @@ class FilteringProxy:
             lines.append(f"{name}: {value}")
         lines.append("Connection: close")
         try:
-            upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode(
-                "latin-1"))
+            upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
         except OSError:
             upstream.close()
-            self.audit(type="net.allow", domain=domain, port=port,
-                       scheme="http", decision="allow",
-                       reason="upstream_failed")
+            self.audit(
+                type="net.allow",
+                domain=domain,
+                port=port,
+                scheme="http",
+                decision="allow",
+                reason="upstream_failed",
+            )
             self.send_error(conn, 502, "parent write failed")
             return
-        self.audit(type="net.allow", domain=domain, port=port,
-                   scheme="http", decision="allow", reason="ok")
+        self.audit(
+            type="net.allow",
+            domain=domain,
+            port=port,
+            scheme="http",
+            decision="allow",
+            reason="ok",
+        )
         try:
             splice(conn, upstream)
         finally:
@@ -957,8 +1077,9 @@ class FilteringProxy:
                 pass
 
 
-def start_proxy(net_config, data_dir, audit_append=None,
-                gate_check=None, resolver_fn=None) -> ProxyHandle:
+def start_proxy(
+    net_config, data_dir, audit_append=None, gate_check=None, resolver_fn=None
+) -> ProxyHandle:
     """Start the filtering proxy; returns a handle with .tcp_port/.stop().
 
     Listens on 127.0.0.1 (ephemeral TCP port) and on
@@ -970,9 +1091,7 @@ def start_proxy(net_config, data_dir, audit_append=None,
     via the host).
     """
     if getattr(net_config, "mode", "allowlist") != "allowlist":
-        raise ValueError(
-            "filtering proxy requires network.mode 'allowlist'"
-        )
+        raise ValueError("filtering proxy requires network.mode 'allowlist'")
     directory = Path(data_dir)
     if not directory.exists():
         directory.mkdir(parents=True, mode=0o700)

@@ -90,9 +90,7 @@ def _point_add(
     return (x * _inv(den_x)) % Q, (y * _inv(den_y)) % Q
 
 
-def _point_mul(scalar: int, point: tuple[int, int] | None) -> (
-    tuple[int, int] | None
-):
+def _point_mul(scalar: int, point: tuple[int, int] | None) -> tuple[int, int] | None:
     result: tuple[int, int] | None = None
     addend = point
     n = scalar % L
@@ -107,13 +105,13 @@ def _point_mul(scalar: int, point: tuple[int, int] | None) -> (
 # Base point: y = 4/5, x even per RFC 8032.
 _BASE_Y = (4 * _inv(5)) % Q
 _BASE_X = _x_from_y(_BASE_Y)
-assert _BASE_X is not None
+assert _BASE_X is not None  # nosec B101  # vendored Ed25519 base-point invariant
 BASE: tuple[int, int] = (_BASE_X, _BASE_Y)
 
 
 def _clamp(scalar: bytes) -> int:
     """Clamp the lower half of SHA-512(seed) per RFC 8032."""
-    assert len(scalar) == 32
+    assert len(scalar) == 32  # nosec B101  # vendored Ed25519 input-length invariant
     a = bytearray(scalar)
     a[0] &= 248
     a[31] &= 63
@@ -133,7 +131,7 @@ def public_key_from_seed(seed: bytes) -> bytes:
     digest = hashlib.sha512(seed).digest()
     a = _clamp(digest[:32])
     point = _point_mul(a, BASE)
-    assert point is not None
+    assert point is not None  # nosec B101  # vendored Ed25519 point invariant
     return _encode_point(*point)
 
 
@@ -144,16 +142,12 @@ def sign(seed: bytes, message: bytes) -> bytes:
     digest = hashlib.sha512(seed).digest()
     a = _clamp(digest[:32])
     prefix = digest[32:]
-    r = int.from_bytes(
-        hashlib.sha512(prefix + message).digest(), "little"
-    ) % L
+    r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % L
     r_point = _point_mul(r, BASE)
-    assert r_point is not None
+    assert r_point is not None  # nosec B101  # vendored Ed25519 point invariant
     r_enc = _encode_point(*r_point)
     pub = public_key_from_seed(seed)
-    h = int.from_bytes(
-        hashlib.sha512(r_enc + pub + message).digest(), "little"
-    ) % L
+    h = int.from_bytes(hashlib.sha512(r_enc + pub + message).digest(), "little") % L
     s = (r + h * a) % L
     return r_enc + s.to_bytes(32, "little")
 
@@ -175,9 +169,10 @@ def verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
     # Reject small-order R (prevents signature malleability tricks).
     if _point_mul(L, r_point) is not None:
         return False
-    h = int.from_bytes(
-        hashlib.sha512(r_enc + public_key + message).digest(), "little"
-    ) % L
+    h = (
+        int.from_bytes(hashlib.sha512(r_enc + public_key + message).digest(), "little")
+        % L
+    )
     s = int.from_bytes(s_enc, "little")
     left = _point_mul(s, BASE)
     ha = _point_mul(h, a_point)

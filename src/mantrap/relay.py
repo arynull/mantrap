@@ -132,15 +132,12 @@ def main(argv: list[str]) -> int:
         probe.connect(sock_path)
         probe.close()
     except OSError as exc:
-        print(f"relay: cannot reach proxy socket {sock_path}: {exc}",
-              file=sys.stderr)
+        print(f"relay: cannot reach proxy socket {sock_path}: {exc}", file=sys.stderr)
         return 1
     try:
-        listener = socket.create_server(
-            ("127.0.0.1", port_no), backlog=64)
+        listener = socket.create_server(("127.0.0.1", port_no), backlog=64)
     except OSError as exc:
-        print(f"relay: cannot listen on 127.0.0.1:{port_no}: {exc}",
-              file=sys.stderr)
+        print(f"relay: cannot listen on 127.0.0.1:{port_no}: {exc}", file=sys.stderr)
         return 1
     pid = os.fork()
     if pid != 0:
@@ -149,10 +146,9 @@ def main(argv: list[str]) -> int:
         if status != 0:
             return 1
         try:
-            os.execvp(workload[0], workload)
+            os.execvp(workload[0], workload)  # nosec B606  # fixed argv, no shell
         except OSError as exc:
-            print(f"relay: cannot exec {workload[0]}: {exc}",
-                  file=sys.stderr)
+            print(f"relay: cannot exec {workload[0]}: {exc}", file=sys.stderr)
             return 127
         return 127
     try:
